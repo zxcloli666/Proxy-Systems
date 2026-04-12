@@ -25,6 +25,7 @@ pub struct Upstream {
 
 fn base_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
+        .http1_only()
         .connect_timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(128)
         .tcp_keepalive(Duration::from_secs(30))

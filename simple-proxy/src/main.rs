@@ -15,6 +15,7 @@ async fn main() {
     let port = port_from_env(8080);
 
     let client = Client::builder()
+        .http1_only()
         .pool_max_idle_per_host(128)
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .tcp_nodelay(true)
