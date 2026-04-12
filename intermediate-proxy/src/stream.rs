@@ -13,7 +13,7 @@ use crate::queue::ProxyQueue;
 use crate::upstream::Upstream;
 
 /// Status codes that trigger failover to the next proxy.
-const RATE_LIMIT_CODES: &[u16] = &[429, 500, 503];
+const RATE_LIMIT_CODES: &[u16] = &[429, 500, 502, 503];
 
 /// Response headers to skip when forwarding.
 const SKIP_RESPONSE_HEADERS: &[&str] = &["content-encoding", "content-length", "transfer-encoding"];
@@ -66,17 +66,19 @@ pub async fn forward_with_failover(
                 .await;
             }
             Err(e) => {
-                warn!("Error with {}: {}", upstream.url, e);
+                warn!("Error with {}: {:?}", upstream.url, e);
                 queue.mark_error(&upstream.url).await;
-                queue.move_to_end(&upstream.url, snapshot_version).await;
-                last_error = Some(e.to_string());
+                if e.is_timeout() {
+                    queue.move_to_end(&upstream.url, snapshot_version).await;
+                }
+                last_error = Some(format!("{:?}", e));
             }
         }
     }
 
     queue.mark_all_failed().await;
     let msg = last_error.unwrap_or_else(|| "All proxy servers failed".to_string());
-    error!("{}", msg);
+    error!("All proxies exhausted: {}", msg);
     proxy_common::response::text_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         &format!("Proxy Error: {msg}"),
