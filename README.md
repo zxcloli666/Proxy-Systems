@@ -79,7 +79,7 @@ docker build -f Dockerfile.tor-proxy -t tor-proxy .
 Push to `main` with `!release: patch`, `!release: minor`, or `!release: major` in the commit message. GitHub Action builds and pushes images to GHCR:
 
 ```
-ghcr.io/<owner>/proxy-systems/simple-proxy:<version>
-ghcr.io/<owner>/proxy-systems/intermediate-proxy:<version>
-ghcr.io/<owner>/proxy-systems/tor-proxy:<version>
+ghcr.io/zxcloli666/proxy-systems/simple-proxy:latest
+ghcr.io/zxcloli666/proxy-systems/intermediate-proxy:latest
+ghcr.io/zxcloli666/proxy-systems/tor-proxy:latest
 ```
