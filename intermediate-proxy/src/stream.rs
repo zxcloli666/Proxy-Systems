@@ -14,7 +14,8 @@ use crate::queue::ProxyQueue;
 use crate::upstream::Upstream;
 
 /// Status codes that trigger failover to the next proxy.
-const RATE_LIMIT_CODES: &[u16] = &[403, 421, 429, 500, 502, 503];
+const RATE_LIMIT_CODES: &[u16] = &[421, 429, 500, 502, 503];
+const SKIP_CODES: &[u16] = &[403];
 
 /// Response headers to skip when forwarding.
 const SKIP_RESPONSE_HEADERS: &[&str] = &["content-encoding", "content-length", "transfer-encoding"];
@@ -48,6 +49,12 @@ pub async fn forward_with_failover(
                     queue.mark_error(&upstream.url).await;
                     queue.move_to_end(&upstream.url, snapshot_version).await;
                     last_error = Some(format!("Rate limited: {status_code}"));
+                    continue;
+                }
+
+                if SKIP_CODES.contains(&status_code) {
+                    warn!("Skipping proxy {} (status {})", upstream.url, status_code);
+                    last_error = Some(format!("Skipped: {status_code}"));
                     continue;
                 }
 
