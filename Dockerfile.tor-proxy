@@ -1,8 +1,24 @@
 FROM rust:1-alpine AS builder
 RUN apk add --no-cache musl-dev cmake make perl
 WORKDIR /build
+
+# Cache dependencies
+COPY Cargo.toml Cargo.lock ./
+COPY proxy-common/Cargo.toml proxy-common/Cargo.toml
+COPY simple-proxy/Cargo.toml simple-proxy/Cargo.toml
+COPY intermediate-proxy/Cargo.toml intermediate-proxy/Cargo.toml
+COPY tor-proxy/Cargo.toml tor-proxy/Cargo.toml
+RUN mkdir -p proxy-common/src simple-proxy/src intermediate-proxy/src tor-proxy/src \
+    && echo "fn main(){}" > simple-proxy/src/main.rs \
+    && echo "fn main(){}" > intermediate-proxy/src/main.rs \
+    && echo "fn main(){}" > tor-proxy/src/main.rs \
+    && touch proxy-common/src/lib.rs \
+    && cargo build --release --bin tor-proxy || true
+
+# Build actual code
 COPY . .
-RUN cargo build --release --bin tor-proxy
+RUN touch tor-proxy/src/main.rs proxy-common/src/lib.rs \
+    && cargo build --release --bin tor-proxy
 
 FROM alpine:3.21
 COPY --from=builder /build/target/release/tor-proxy /usr/local/bin/

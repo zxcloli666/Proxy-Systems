@@ -82,6 +82,8 @@ jobs:
           context: .
           file: Dockerfile.simple-proxy
           push: true
+          cache-from: type=gha,scope=simple-proxy
+          cache-to: type=gha,mode=max,scope=simple-proxy
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/simple-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/simple-proxy:latest
@@ -92,6 +94,8 @@ jobs:
           context: .
           file: Dockerfile.intermediate-proxy
           push: true
+          cache-from: type=gha,scope=intermediate-proxy
+          cache-to: type=gha,mode=max,scope=intermediate-proxy
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/intermediate-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/intermediate-proxy:latest
@@ -102,6 +106,8 @@ jobs:
           context: .
           file: Dockerfile.tor-proxy
           push: true
+          cache-from: type=gha,scope=tor-proxy
+          cache-to: type=gha,mode=max,scope=tor-proxy
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/tor-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/tor-proxy:latest

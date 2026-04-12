@@ -6,6 +6,7 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use proxy_common::cors::cors_headers;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -32,10 +33,14 @@ pub async fn forward_with_failover(
     for (i, upstream) in snapshot_proxies.iter().enumerate() {
         info!("Trying proxy: {}", upstream.url);
 
-        let result = send_to_upstream(upstream, method, headers, body.clone(), None).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            send_to_upstream(upstream, method, headers, body.clone(), None),
+        )
+        .await;
 
         match result {
-            Ok(response) => {
+            Ok(Ok(response)) => {
                 let status_code = response.status().as_u16();
 
                 if RATE_LIMIT_CODES.contains(&status_code) {
@@ -65,13 +70,19 @@ pub async fn forward_with_failover(
                 )
                 .await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Error with {}: {:?}", upstream.url, e);
                 queue.mark_error(&upstream.url).await;
                 if e.is_timeout() {
                     queue.move_to_end(&upstream.url, snapshot_version).await;
                 }
                 last_error = Some(format!("{:?}", e));
+            }
+            Err(_) => {
+                warn!("Timeout (10s) connecting to {}", upstream.url);
+                queue.mark_error(&upstream.url).await;
+                queue.move_to_end(&upstream.url, snapshot_version).await;
+                last_error = Some(format!("Timeout connecting to {}", upstream.url));
             }
         }
     }
