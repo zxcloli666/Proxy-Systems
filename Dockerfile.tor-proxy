@@ -1,0 +1,9 @@
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev cmake make perl
+WORKDIR /build
+COPY . .
+RUN cargo build --release --bin tor-proxy
+
+FROM alpine:3.21
+COPY --from=builder /build/target/release/tor-proxy /usr/local/bin/
+CMD ["tor-proxy"]

@@ -1,0 +1,37 @@
+[workspace]
+members = ["proxy-common", "simple-proxy", "intermediate-proxy", "tor-proxy"]
+resolver = "2"
+
+[workspace.dependencies]
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "socks",
+    "stream",
+    "gzip",
+    "brotli",
+] }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+tower-http = { version = "0.6", features = ["cors"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+webpki-roots = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
