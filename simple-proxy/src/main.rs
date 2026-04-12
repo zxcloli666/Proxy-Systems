@@ -1,8 +1,8 @@
 mod handler;
 mod redirect;
 
-use axum::Router;
 use axum::routing::any;
+use axum::Router;
 use proxy_common::cors::cors_layer;
 use proxy_common::server::{bind_tcp, init_tracing, port_from_env};
 use reqwest::Client;

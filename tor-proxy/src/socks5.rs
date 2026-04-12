@@ -15,7 +15,9 @@ pub async fn socks5_connect(
     let addr = format!("{proxy_host}:{proxy_port}");
     let mut stream = timeout(connect_timeout, TcpStream::connect(&addr))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS5 connect timeout"))??;
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS5 connect timeout")
+        })??;
 
     // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
     stream.write_all(&[0x05, 0x01, 0x00]).await?;

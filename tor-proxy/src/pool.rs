@@ -196,10 +196,7 @@ impl NodePool {
                     node.cooldown_until = Instant::now() + self.newnym_cooldown;
                     node.consecutive_errors = 0;
                     node.stats.rotations += 1;
-                    info!(
-                        "NEWNYM {} (rotation #{})",
-                        host, node.stats.rotations
-                    );
+                    info!("NEWNYM {} (rotation #{})", host, node.stats.rotations);
                 }
             }
             Err(e) => {

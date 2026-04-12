@@ -12,10 +12,7 @@ use url::Url;
 
 use crate::redirect::resolve_redirect;
 
-pub async fn proxy_handler(
-    State(client): State<Client>,
-    req: Request<Body>,
-) -> Response {
+pub async fn proxy_handler(State(client): State<Client>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
 
@@ -57,7 +54,10 @@ pub async fn proxy_handler(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Proxy error: {}", e);
-            return text_response(StatusCode::SERVICE_UNAVAILABLE, &format!("Proxy Error: {e}"));
+            return text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("Proxy Error: {e}"),
+            );
         }
     };
 

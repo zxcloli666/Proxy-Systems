@@ -10,10 +10,7 @@ use tracing::info;
 use crate::queue::ProxyQueue;
 use crate::stream::forward_with_failover;
 
-pub async fn proxy_handler(
-    State(queue): State<Arc<ProxyQueue>>,
-    req: Request<Body>,
-) -> Response {
+pub async fn proxy_handler(State(queue): State<Arc<ProxyQueue>>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
 
@@ -25,7 +22,11 @@ pub async fn proxy_handler(
         return text_response(StatusCode::BAD_REQUEST, "Missing headers");
     }
 
-    info!("Streaming request: {} to {}", method, decoded.as_deref().unwrap_or("?"));
+    info!(
+        "Streaming request: {} to {}",
+        method,
+        decoded.as_deref().unwrap_or("?")
+    );
 
     // Collect body
     let body = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {

@@ -4,8 +4,8 @@ mod queue;
 mod stream;
 mod upstream;
 
-use axum::Router;
 use axum::routing::{any, get};
+use axum::Router;
 use proxy_common::cors::cors_layer;
 use proxy_common::server::{bind_tcp, init_tracing, port_from_env};
 use std::sync::Arc;

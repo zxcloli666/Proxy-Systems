@@ -5,8 +5,8 @@ mod pool;
 mod socks5;
 mod tunnel;
 
-use axum::Router;
 use axum::routing::{any, get};
+use axum::Router;
 use handler::HandlerState;
 use pool::{NodePool, TorNodeConfig};
 use proxy_common::cors::cors_layer;
@@ -38,7 +38,8 @@ async fn main() {
         })
         .collect();
 
-    let password = std::env::var("TOR_CONTROL_PASSWORD").unwrap_or_else(|_| "torcontrol".to_string());
+    let password =
+        std::env::var("TOR_CONTROL_PASSWORD").unwrap_or_else(|_| "torcontrol".to_string());
     let rotation_interval = std::env::var("ROTATION_INTERVAL_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -60,7 +61,14 @@ async fn main() {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(30_000);
 
-    info!("Tor nodes: {}", tor_nodes.iter().map(|n| n.host.as_str()).collect::<Vec<_>>().join(", "));
+    info!(
+        "Tor nodes: {}",
+        tor_nodes
+            .iter()
+            .map(|n| n.host.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     info!(
         "Rotation: every {}s | threshold: {} errors",
         rotation_interval / 1000,

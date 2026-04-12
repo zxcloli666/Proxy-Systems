@@ -17,10 +17,7 @@ pub fn cors_layer() -> CorsLayer {
 
 pub fn cors_headers() -> [(&'static str, HeaderValue); 3] {
     [
-        (
-            "access-control-allow-origin",
-            HeaderValue::from_static("*"),
-        ),
+        ("access-control-allow-origin", HeaderValue::from_static("*")),
         (
             "access-control-allow-methods",
             HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),

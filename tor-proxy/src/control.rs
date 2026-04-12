@@ -34,7 +34,10 @@ pub async fn send_newnym(host: &str, port: u16, password: &str) -> std::io::Resu
     reader.read_line(&mut line).await?;
 
     if !line.starts_with("250") {
-        return Err(std::io::Error::other(format!("NEWNYM failed: {}", line.trim())));
+        return Err(std::io::Error::other(format!(
+            "NEWNYM failed: {}",
+            line.trim()
+        )));
     }
 
     Ok(())

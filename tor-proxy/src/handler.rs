@@ -32,21 +32,28 @@ pub struct HandlerState {
     pub request_timeout: Duration,
 }
 
-pub async fn proxy_handler(
-    State(state): State<HandlerState>,
-    req: Request<Body>,
-) -> Response {
+pub async fn proxy_handler(State(state): State<HandlerState>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
 
     let target_header = match headers.get("x-target").and_then(|v| v.to_str().ok()) {
         Some(v) => v.to_string(),
-        None => return text_response(StatusCode::BAD_REQUEST, "Missing or invalid X-Target header"),
+        None => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "Missing or invalid X-Target header",
+            )
+        }
     };
 
     let target_url = match decode_target(&target_header) {
         Some(url) => url,
-        None => return text_response(StatusCode::BAD_REQUEST, "Missing or invalid X-Target header"),
+        None => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "Missing or invalid X-Target header",
+            )
+        }
     };
 
     info!("{} {}", method, target_url);
@@ -116,7 +123,10 @@ pub async fn proxy_handler(
 
     error!("All {} tor nodes failed", ordered.len());
     let msg = last_error.unwrap_or_else(|| "all nodes failed".to_string());
-    text_response(StatusCode::SERVICE_UNAVAILABLE, &format!("Tor proxy error: {msg}"))
+    text_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("Tor proxy error: {msg}"),
+    )
 }
 
 fn build_response(

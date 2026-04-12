@@ -17,10 +17,14 @@ pub async fn bind_tcp(port: u16) -> TcpListener {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     let socket = tokio::net::TcpSocket::new_v4().expect("failed to create socket");
-    socket.set_reuseaddr(true).expect("failed to set SO_REUSEADDR");
+    socket
+        .set_reuseaddr(true)
+        .expect("failed to set SO_REUSEADDR");
 
     #[cfg(target_os = "linux")]
-    socket.set_reuseport(true).expect("failed to set SO_REUSEPORT");
+    socket
+        .set_reuseport(true)
+        .expect("failed to set SO_REUSEPORT");
 
     socket.bind(addr).expect("failed to bind");
     socket.listen(1024).expect("failed to listen")

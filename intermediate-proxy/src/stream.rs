@@ -160,9 +160,7 @@ async fn build_streaming_response(
                     );
 
                     if !can_recover {
-                        let _ = tx
-                            .send(Err(std::io::Error::other(e.to_string())))
-                            .await;
+                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                         break;
                     }
 
@@ -229,8 +227,7 @@ async fn build_streaming_response(
                                                     if chunk_len <= remaining {
                                                         skipped += chunk_len;
                                                     } else {
-                                                        let keep =
-                                                            &chunk[remaining as usize..];
+                                                        let keep = &chunk[remaining as usize..];
                                                         total_bytes += keep.len() as u64;
                                                         if tx
                                                             .send(Ok(Bytes::copy_from_slice(keep)))

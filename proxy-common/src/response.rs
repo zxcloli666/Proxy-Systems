@@ -21,9 +21,6 @@ pub fn json_response(status: StatusCode, body: &str) -> Response {
     for (name, value) in cors_headers() {
         headers.insert(name, value);
     }
-    headers.insert(
-        "content-type",
-        HeaderValue::from_static("application/json"),
-    );
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
     response
 }
