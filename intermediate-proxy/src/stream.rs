@@ -13,7 +13,7 @@ use crate::queue::ProxyQueue;
 use crate::upstream::Upstream;
 
 /// Status codes that trigger failover to the next proxy.
-const RATE_LIMIT_CODES: &[u16] = &[429, 500, 502, 503];
+const RATE_LIMIT_CODES: &[u16] = &[421, 429, 500, 502, 503];
 
 /// Response headers to skip when forwarding.
 const SKIP_RESPONSE_HEADERS: &[&str] = &["content-encoding", "content-length", "transfer-encoding"];
