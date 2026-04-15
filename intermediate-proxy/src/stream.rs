@@ -98,7 +98,7 @@ pub async fn forward_with_failover(
     let msg = last_error.unwrap_or_else(|| "All proxy servers failed".to_string());
     error!("All proxies exhausted: {}", msg);
     proxy_common::response::text_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
         &format!("Proxy Error: {msg}"),
     )
 }
