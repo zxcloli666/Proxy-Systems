@@ -2,12 +2,14 @@ mod handler;
 mod health;
 mod queue;
 mod stream;
+mod tls;
 mod upstream;
 
 use axum::routing::{any, get};
 use axum::Router;
 use proxy_common::cors::cors_layer;
 use proxy_common::server::{bind_tcp, init_tracing, port_from_env};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -19,8 +21,6 @@ use crate::queue::{
 #[tokio::main]
 async fn main() {
     init_tracing("info");
-
-    let port = port_from_env(3000);
 
     let regular_urls = parse_urls_env("PROXY_URL", "http://localhost:8080");
     let reserve_urls = parse_urls_env("RESERVE_PROXY_URL", "");
@@ -56,10 +56,32 @@ async fn main() {
         .layer(cors_layer())
         .with_state(Arc::clone(&queue));
 
-    let listener = bind_tcp(port).await;
-    info!("Intermediate Proxy running on http://0.0.0.0:{port}");
+    if env_bool("TLS_ENABLED", false) {
+        let domains_env = std::env::var("DOMAINS").unwrap_or_default();
+        let domains = tls::parse_domains(&domains_env);
+        if domains.is_empty() {
+            panic!("TLS_ENABLED=true but DOMAINS is empty (expected comma-separated domain list)");
+        }
+        let email = std::env::var("ACME_EMAIL")
+            .unwrap_or_else(|_| format!("admin@{}", domains[0]));
+        let cache_dir = PathBuf::from(
+            std::env::var("ACME_CACHE_DIR").unwrap_or_else(|_| "/var/cache/acme".to_string()),
+        );
+        let staging = env_bool("ACME_STAGING", false);
 
-    axum::serve(listener, app).await.expect("server error");
+        info!(
+            "TLS mode on: {} domain(s), cache={:?}, staging={}",
+            domains.len(),
+            cache_dir,
+            staging
+        );
+        tls::serve(domains, email, cache_dir, staging, app).await;
+    } else {
+        let port = port_from_env(3000);
+        let listener = bind_tcp(port).await;
+        info!("Intermediate Proxy running on http://0.0.0.0:{port}");
+        axum::serve(listener, app).await.expect("server error");
+    }
 }
 
 fn parse_urls_env(key: &str, default: &str) -> Vec<String> {
@@ -75,5 +97,12 @@ fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(default)
 }

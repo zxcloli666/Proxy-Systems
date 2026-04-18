@@ -30,6 +30,8 @@ futures-util = "0.3"
 tokio-stream = "0.1"
 webpki-roots = "1"
 arc-swap = "1"
+rustls-acme = { version = "0.14", features = ["axum"] }
+axum-server = "0.7"
 
 [profile.release]
 lto = true

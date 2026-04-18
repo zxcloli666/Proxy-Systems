@@ -40,6 +40,28 @@ Smart router with automatic failover, latency-aware tier ordering, and lock-free
 
 `GET /health` returns per-proxy tier, average / last latency, success/error counts, consecutive failures, last error reason, plus tier totals.
 
+#### Built-in TLS (Let's Encrypt)
+
+The intermediate-proxy can terminate TLS directly — no nginx needed. Certificates are issued and renewed automatically via ACME (TLS-ALPN-01 challenge on :443). When TLS is enabled the proxy binds **:80** (plain HTTP) and **:443** (HTTPS with SNI for all configured domains); `PORT` is ignored.
+
+| Env | Description | Default |
+|-----|-------------|---------|
+| `TLS_ENABLED` | Enable HTTPS mode (binds :80 + :443, ignores `PORT`) | `false` |
+| `DOMAINS` | Comma-separated list of domain names served on :443 | — |
+| `ACME_EMAIL` | Contact email for Let's Encrypt | `admin@{first domain}` |
+| `ACME_CACHE_DIR` | Persistent cert cache directory (mount a volume) | `/var/cache/acme` |
+| `ACME_STAGING` | Use Let's Encrypt staging directory for testing | `false` |
+
+Example:
+
+```
+TLS_ENABLED=true
+DOMAINS=proxy.example.com,api.example.com
+ACME_EMAIL=admin@example.com
+```
+
+The cache directory must survive restarts (mount a Docker volume to `/var/cache/acme`), otherwise the proxy will hit Let's Encrypt rate limits on every restart. Start with `ACME_STAGING=true` when setting up a new deployment. DNS for every entry in `DOMAINS` must resolve to this host, and port 443 must be reachable from the internet for ACME validation.
+
 ### tor-proxy
 
 Routes requests through Tor via SOCKS5 with automatic circuit rotation.

@@ -17,3 +17,6 @@ serde_json = { workspace = true }
 futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 arc-swap = { workspace = true }
+rustls = { workspace = true }
+rustls-acme = { workspace = true }
+axum-server = { workspace = true }
