@@ -19,6 +19,11 @@ use tracing::info;
 async fn main() {
     init_tracing("info");
 
+    // rustls 0.23 no longer auto-selects a crypto provider; install the ring
+    // backend once before any `rustls::ClientConfig::builder()` runs. The
+    // Result is Err if already installed — fine to ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let port = port_from_env(8080);
 
     let tor_nodes: Vec<TorNodeConfig> = std::env::var("TOR_NODES")

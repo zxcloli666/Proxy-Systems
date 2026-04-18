@@ -20,8 +20,49 @@ const RATE_LIMIT_CODES: &[u16] = &[421, 429, 500, 502, 503];
 const SKIP_CODES: &[u16] = &[403];
 
 /// Response headers we strip when forwarding to the client.
-const SKIP_RESPONSE_HEADERS: &[&str] =
-    &["content-encoding", "content-length", "transfer-encoding"];
+///
+/// Keeping the outgoing header block small is important: downstream nginx
+/// installations often default to a 4–8 KiB `proxy_buffer_size` and reject
+/// the response with `upstream sent too big header` otherwise. We drop:
+///  - body/framing headers that we recompute (content-length, transfer-encoding, content-encoding);
+///  - CORS — we emit our own, and duplicates blow up the header block;
+///  - Cloudflare edge chaff that the client doesn't need;
+///  - reporting / timing headers that can carry multi-KiB JSON payloads;
+///  - CSP / security hints that are meaningless for a proxied asset.
+const SKIP_RESPONSE_HEADERS: &[&str] = &[
+    // framing
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    // CORS (we set our own)
+    "access-control-allow-origin",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+    "access-control-max-age",
+    // Cloudflare edge chaff
+    "cf-ray",
+    "cf-cache-status",
+    "cf-request-id",
+    "cf-apo-via",
+    "cf-bgj",
+    "cf-polished",
+    "cf-edge-cache",
+    // Reporting / timing (can be large JSON)
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+    "expect-ct",
+    "server-timing",
+    // Protocol upgrade hints (confuse HTTP/1 clients going through nginx)
+    "alt-svc",
+    "alternate-protocol",
+    // Security policies we don't want to propagate through the proxy
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "x-frame-options",
+];
 
 /// Buffer size for the body streaming channel.
 const STREAM_CHUNK_BUFFER: usize = 64;
