@@ -94,10 +94,11 @@ impl Entry {
     }
 
     fn record_reason(&self, reason: &str) {
-        let trimmed = if reason.len() > REASON_MAX_LEN {
-            format!("{}…", &reason[..REASON_MAX_LEN])
+        let scrubbed = scrub_credentials(reason);
+        let trimmed = if scrubbed.len() > REASON_MAX_LEN {
+            format!("{}…", &scrubbed[..REASON_MAX_LEN])
         } else {
-            reason.to_string()
+            scrubbed
         };
         if let Ok(mut r) = self.last_error_reason.lock() {
             *r = Some(trimmed);
@@ -282,7 +283,7 @@ impl ProxyQueue {
                 .map(|e| {
                     format!(
                         "{}[{}{} {}ms]",
-                        e.url,
+                        sanitize_url(&e.url),
                         e.tier().as_str(),
                         if e.is_reserve { "/reserve" } else { "" },
                         e.avg_latency_ms.load(Ordering::Relaxed)
@@ -345,7 +346,7 @@ fn entry_json(position: usize, e: &Entry) -> serde_json::Value {
         .and_then(|g| (*g).clone());
     serde_json::json!({
         "position": position + 1,
-        "url": e.url,
+        "url": sanitize_url(&e.url),
         "isReserve": e.is_reserve,
         "tier": e.tier().as_str(),
         "avgLatencyMs": e.avg_latency_ms.load(Ordering::Relaxed),
@@ -359,6 +360,72 @@ fn entry_json(position: usize, e: &Entry) -> serde_json::Value {
         "lastErrorMs": e.last_error_ms.load(Ordering::Relaxed),
         "lastErrorReason": reason,
     })
+}
+
+/// Scrub `user:pass@` credentials from any URL-looking substrings in a
+/// free-form text (reqwest error messages frequently embed URLs).
+pub fn scrub_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("://") {
+        out.push_str(&rest[..idx + 3]);
+        let tail = &rest[idx + 3..];
+        let boundary = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>' | '<' | ',' | ';')
+            })
+            .unwrap_or(tail.len());
+        let chunk = &tail[..boundary];
+        let authority_end = chunk.find(['/', '?', '#']).unwrap_or(chunk.len());
+        let authority = &chunk[..authority_end];
+        let after_authority = &chunk[authority_end..];
+        let masked_authority = match authority.rfind('@') {
+            Some(at) => {
+                let userinfo = &authority[..at];
+                let host = &authority[at + 1..];
+                let masked_userinfo = match userinfo.find(':') {
+                    Some(c) => format!("{}:***", &userinfo[..c]),
+                    None => userinfo.to_string(),
+                };
+                format!("{masked_userinfo}@{host}")
+            }
+            None => authority.to_string(),
+        };
+        out.push_str(&masked_authority);
+        out.push_str(after_authority);
+        rest = &tail[boundary..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Mask the password portion of `scheme://user:pass@host/...` so we don't
+/// leak upstream credentials into logs or the /health endpoint.
+pub fn sanitize_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &authority[..at_pos];
+    let host = &authority[at_pos + 1..];
+    let masked_userinfo = match userinfo.find(':') {
+        Some(colon) => format!("{}:***", &userinfo[..colon]),
+        None => userinfo.to_string(),
+    };
+    format!(
+        "{}://{}@{}{}",
+        &url[..scheme_end],
+        masked_userinfo,
+        host,
+        &after_scheme[authority_end..]
+    )
 }
 
 fn now_ms() -> u64 {

@@ -11,7 +11,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::queue::{Entry, ProxyQueue};
+use crate::queue::{sanitize_url, Entry, ProxyQueue};
 use crate::upstream::Upstream;
 
 /// Status codes that trigger failover to the next proxy.
@@ -84,7 +84,7 @@ pub async fn forward_with_failover(
         tried.insert(entry.url.clone());
         debug!(
             "→ upstream {} [{}] lat={}ms",
-            entry.url,
+            sanitize_url(&entry.url),
             entry.tier().as_str(),
             entry.avg_latency_ms.load(std::sync::atomic::Ordering::Relaxed)
         );
@@ -104,7 +104,9 @@ pub async fn forward_with_failover(
                 if RATE_LIMIT_CODES.contains(&status_code) {
                     debug!(
                         "upstream {} replied {} in {}ms (soft-fail)",
-                        entry.url, status_code, elapsed_ms
+                        sanitize_url(&entry.url),
+                        status_code,
+                        elapsed_ms
                     );
                     queue.record_soft_error(
                         entry,
@@ -118,7 +120,9 @@ pub async fn forward_with_failover(
                 if SKIP_CODES.contains(&status_code) {
                     debug!(
                         "upstream {} returned skip code {} ({}ms)",
-                        entry.url, status_code, elapsed_ms
+                        sanitize_url(&entry.url),
+                        status_code,
+                        elapsed_ms
                     );
                     last_error = Some(format!("skipped {status_code}"));
                     continue;
@@ -126,7 +130,9 @@ pub async fn forward_with_failover(
 
                 debug!(
                     "upstream {} success {} in {}ms",
-                    entry.url, status_code, elapsed_ms
+                    sanitize_url(&entry.url),
+                    status_code,
+                    elapsed_ms
                 );
                 queue.record_success(entry, elapsed_ms);
 
@@ -149,7 +155,9 @@ pub async fn forward_with_failover(
             Ok(Err(e)) => {
                 warn!(
                     "upstream {} connection error in {}ms: {}",
-                    entry.url, elapsed_ms, e
+                    sanitize_url(&entry.url),
+                    elapsed_ms,
+                    e
                 );
                 queue.record_hard_error(entry, &format!("{e}"));
                 last_error = Some(format!("{e}"));
@@ -157,7 +165,7 @@ pub async fn forward_with_failover(
             Err(_) => {
                 warn!(
                     "upstream {} timed out after {}ms",
-                    entry.url,
+                    sanitize_url(&entry.url),
                     upstream_timeout.as_millis()
                 );
                 queue.record_hard_error(
@@ -253,7 +261,9 @@ async fn build_streaming_response(
                 Some(Err(e)) => {
                     error!(
                         "stream error on {} after {} bytes: {}",
-                        current_url, total_bytes, e
+                        sanitize_url(&current_url),
+                        total_bytes,
+                        e
                     );
 
                     if !can_recover {
@@ -284,7 +294,7 @@ async fn build_streaming_response(
 
                         info!(
                             "recovery: trying {} [{}]",
-                            next.url,
+                            sanitize_url(&next.url),
                             next.tier().as_str()
                         );
 
@@ -319,7 +329,9 @@ async fn build_streaming_response(
                                 if recovery_status == 206 || recovery_status == 200 {
                                     info!(
                                         "recovery established via {} ({}) in {}ms",
-                                        next.url, recovery_status, elapsed_ms
+                                        sanitize_url(&next.url),
+                                        recovery_status,
+                                        elapsed_ms
                                     );
                                     queue.record_success(next, elapsed_ms);
 
@@ -333,7 +345,8 @@ async fn build_streaming_response(
                                     if recovery_status == 200 && total_bytes > 0 {
                                         warn!(
                                             "range ignored by {} — skipping {} bytes",
-                                            next.url, total_bytes
+                                            sanitize_url(&next.url),
+                                            total_bytes
                                         );
                                         let mut skipped: u64 = 0;
                                         while skipped < total_bytes {
@@ -371,7 +384,9 @@ async fn build_streaming_response(
                                 } else if RATE_LIMIT_CODES.contains(&recovery_status) {
                                     warn!(
                                         "recovery: {} replied {} in {}ms (soft-fail)",
-                                        next.url, recovery_status, elapsed_ms
+                                        sanitize_url(&next.url),
+                                        recovery_status,
+                                        elapsed_ms
                                     );
                                     queue.record_soft_error(
                                         next,
@@ -381,7 +396,9 @@ async fn build_streaming_response(
                                 } else {
                                     warn!(
                                         "recovery: {} returned {} in {}ms",
-                                        next.url, recovery_status, elapsed_ms
+                                        sanitize_url(&next.url),
+                                        recovery_status,
+                                        elapsed_ms
                                     );
                                     queue.record_hard_error(
                                         next,
@@ -392,14 +409,16 @@ async fn build_streaming_response(
                             Ok(Err(re)) => {
                                 warn!(
                                     "recovery: {} connection failed in {}ms: {}",
-                                    next.url, elapsed_ms, re
+                                    sanitize_url(&next.url),
+                                    elapsed_ms,
+                                    re
                                 );
                                 queue.record_hard_error(next, &format!("recovery: {re}"));
                             }
                             Err(_) => {
                                 warn!(
                                     "recovery: {} timed out after {}ms",
-                                    next.url,
+                                    sanitize_url(&next.url),
                                     upstream_timeout.as_millis()
                                 );
                                 queue.record_hard_error(next, "recovery timeout");
