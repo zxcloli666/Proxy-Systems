@@ -16,11 +16,13 @@ Basic reverse proxy. Receives the target URL as a base64-encoded `X-Target` head
 
 ### intermediate-proxy
 
-Smart router with automatic failover across multiple upstream proxies.
+Smart router with automatic failover, latency-aware tier ordering, and lock-free hot path.
 
-- **Priority queue** with versioned reordering — only the first concurrent request to fail on a proxy modifies the global order
-- **Reserve proxies** — emergency backups that always stay at the end of the queue
-- **Stream recovery** — on mid-stream failure for GET requests with cache/media headers, resumes from the next proxy using `Range` header
+- **Tiered priority queue** — each upstream is classified as `healthy` / `slow` / `failed` from runtime stats (EWMA latency, consecutive failures). Ordering is `(regular ⟶ reserve) × (healthy ⟶ slow ⟶ failed)`, so bad proxies drift to a "not recommended" zone and reserves always stay at the end.
+- **Lock-free snapshots** — reads use `ArcSwap`; stats are plain atomics. A background task re-sorts the queue when a tier transition is detected (debounced by `RESORT_INTERVAL_MS`).
+- **Outcome classification** — `421/429/500/502/503` → soft-fail (penalized latency), `403` → skip without penalty (target block), network error / timeout → hard-fail.
+- **Stream recovery** — on mid-stream failure for GET requests with cache/media headers, resumes from the next un-tried proxy (using the live snapshot) via `Range` header.
+- **HTTP/1 only** — required for Cloudflare `workers.dev` upstreams.
 - **Upstream types** determined by URL scheme:
   - `http://` / `https://` — endpoint (forward with `X-Target` header)
   - `socks5://host:port` — SOCKS5 proxy (request goes directly to target)
@@ -32,6 +34,11 @@ Smart router with automatic failover across multiple upstream proxies.
 |-----|-------------|---------|
 | `PROXY_URL` | Comma-separated list of upstream proxies | `http://localhost:8080` |
 | `RESERVE_PROXY_URL` | Comma-separated list of reserve proxies | — |
+| `SLOW_THRESHOLD_MS` | EWMA latency above this demotes a proxy to the `slow` tier | `3000` |
+| `UPSTREAM_TIMEOUT_MS` | Per-attempt time-to-first-byte timeout | `10000` |
+| `RESORT_INTERVAL_MS` | Max delay between queue re-sorts when stats change | `2000` |
+
+`GET /health` returns per-proxy tier, average / last latency, success/error counts, consecutive failures, last error reason, plus tier totals.
 
 ### tor-proxy
 
@@ -57,6 +64,16 @@ Routes requests through Tor via SOCKS5 with automatic circuit rotation.
 ## Health checks
 
 All proxies expose `GET /health` returning JSON with current status and stats.
+
+## Logging
+
+All services share the same logging setup. Levels are resolved in this order:
+
+1. `RUST_LOG` — full [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directive, e.g. `RUST_LOG=intermediate_proxy=debug,warn`.
+2. `LOG_LEVEL` — simple level name: `trace` / `debug` / `info` / `warn` / `error`.
+3. Built-in default (`info`).
+
+For production set `LOG_LEVEL=warn` (or `error`). Per-request / per-upstream-attempt traces live at `debug`, so they vanish under `warn` and don't cost CPU. Tier changes, queue re-sorts, recovery events, and real network errors stay at `info` / `warn`.
 
 ## Build
 
