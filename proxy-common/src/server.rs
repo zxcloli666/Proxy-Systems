@@ -3,13 +3,21 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-/// Initialize tracing with the given default level (e.g. "info").
+/// Initialize tracing. Resolution order:
+///   1. `RUST_LOG` (full EnvFilter directive, e.g. `intermediate_proxy=debug,warn`)
+///   2. `LOG_LEVEL` (simple level name: trace/debug/info/warn/error)
+///   3. the provided `default_level`
 pub fn init_tracing(default_level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| {
+            let level = std::env::var("LOG_LEVEL")
+                .ok()
+                .unwrap_or_else(|| default_level.to_string());
+            EnvFilter::try_new(level)
+        })
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 /// Create a TCP listener with SO_REUSEADDR on the given port.

@@ -5,7 +5,7 @@ use axum::response::Response;
 use proxy_common::response::text_response;
 use proxy_common::target::decode_target;
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 
 use crate::queue::ProxyQueue;
 use crate::stream::forward_with_failover;
@@ -33,7 +33,7 @@ pub async fn proxy_handler(
 
     let snapshot = queue.snapshot();
 
-    info!(
+    debug!(
         "{} {} ({} bytes) → {} upstream(s)",
         method,
         target,

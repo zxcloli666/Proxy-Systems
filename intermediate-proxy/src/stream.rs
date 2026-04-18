@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::queue::{Entry, ProxyQueue};
 use crate::upstream::Upstream;
@@ -41,7 +41,7 @@ pub async fn forward_with_failover(
 
     for (index, entry) in snapshot.iter().enumerate() {
         tried.insert(entry.url.clone());
-        info!(
+        debug!(
             "→ upstream {} [{}] lat={}ms",
             entry.url,
             entry.tier().as_str(),
@@ -61,7 +61,7 @@ pub async fn forward_with_failover(
                 let status_code = response.status().as_u16();
 
                 if RATE_LIMIT_CODES.contains(&status_code) {
-                    warn!(
+                    debug!(
                         "upstream {} replied {} in {}ms (soft-fail)",
                         entry.url, status_code, elapsed_ms
                     );
@@ -75,15 +75,15 @@ pub async fn forward_with_failover(
                 }
 
                 if SKIP_CODES.contains(&status_code) {
-                    warn!(
-                        "upstream {} returned skip code {} ({}ms) — target block, not penalizing",
+                    debug!(
+                        "upstream {} returned skip code {} ({}ms)",
                         entry.url, status_code, elapsed_ms
                     );
                     last_error = Some(format!("skipped {status_code}"));
                     continue;
                 }
 
-                info!(
+                debug!(
                     "upstream {} success {} in {}ms",
                     entry.url, status_code, elapsed_ms
                 );
