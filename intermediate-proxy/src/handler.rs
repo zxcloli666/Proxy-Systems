@@ -10,46 +10,36 @@ use tracing::info;
 use crate::queue::ProxyQueue;
 use crate::stream::forward_with_failover;
 
-pub async fn proxy_handler(State(queue): State<Arc<ProxyQueue>>, req: Request<Body>) -> Response {
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+pub async fn proxy_handler(
+    State(queue): State<Arc<ProxyQueue>>,
+    req: Request<Body>,
+) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
 
-    // Validate X-Target header
     let target_header = headers.get("x-target").and_then(|v| v.to_str().ok());
     let decoded = target_header.and_then(decode_target);
 
-    if decoded.is_none() {
+    let Some(target) = decoded else {
         return text_response(StatusCode::BAD_REQUEST, "Missing headers");
-    }
+    };
 
-    info!(
-        "Streaming request: {} to {}",
-        method,
-        decoded.as_deref().unwrap_or("?")
-    );
-
-    // Collect body
-    let body = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return text_response(StatusCode::BAD_REQUEST, "Failed to read request body"),
     };
 
-    // Get queue snapshot
-    let snapshot = queue.snapshot().await;
+    let snapshot = queue.snapshot();
 
     info!(
-        "Request proxy snapshot: {} proxies (version {})",
-        snapshot.proxies.len(),
-        snapshot.version
+        "{} {} ({} bytes) → {} upstream(s)",
+        method,
+        target,
+        body.len(),
+        snapshot.len()
     );
 
-    forward_with_failover(
-        &queue,
-        &snapshot.proxies,
-        snapshot.version,
-        &method,
-        &headers,
-        body,
-    )
-    .await
+    forward_with_failover(Arc::clone(&queue), snapshot, &method, &headers, body).await
 }

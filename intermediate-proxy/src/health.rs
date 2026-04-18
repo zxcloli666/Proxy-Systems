@@ -6,6 +6,6 @@ use std::sync::Arc;
 use crate::queue::ProxyQueue;
 
 pub async fn health_handler(State(queue): State<Arc<ProxyQueue>>) -> Response {
-    let status = queue.status().await;
+    let status = queue.status();
     json_response(axum::http::StatusCode::OK, &status.to_string())
 }

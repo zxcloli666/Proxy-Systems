@@ -16,18 +16,20 @@ pub enum UpstreamKind {
     Socks5 { client: Client },
 }
 
-/// An upstream proxy entry with its kind and original URL string.
+/// An upstream proxy entry carrying the configured client(s) for its scheme.
 #[derive(Debug, Clone)]
 pub struct Upstream {
-    pub url: String,
     pub kind: UpstreamKind,
 }
 
 fn base_client_builder() -> reqwest::ClientBuilder {
+    // http1_only is mandatory: workers.dev hosts don't speak HTTP/2 properly
+    // through our upstreams in all paths.
     Client::builder()
         .http1_only()
         .connect_timeout(Duration::from_secs(5))
-        .pool_max_idle_per_host(128)
+        .pool_max_idle_per_host(256)
+        .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -48,7 +50,6 @@ pub fn parse_upstream(url: &str) -> Upstream {
             .build()
             .expect("failed to build socks5 client");
         Upstream {
-            url: url_trimmed.to_string(),
             kind: UpstreamKind::Socks5 { client },
         }
     } else if url_trimmed.starts_with("forward://") {
@@ -58,7 +59,6 @@ pub fn parse_upstream(url: &str) -> Upstream {
             .build()
             .expect("failed to build http proxy client");
         Upstream {
-            url: url_trimmed.to_string(),
             kind: UpstreamKind::HttpProxy { client },
         }
     } else {
@@ -68,7 +68,6 @@ pub fn parse_upstream(url: &str) -> Upstream {
             .build()
             .expect("failed to build endpoint client");
         Upstream {
-            url: url_trimmed.to_string(),
             kind: UpstreamKind::Endpoint {
                 url: url_trimmed.to_string(),
                 client,
