@@ -15,15 +15,13 @@ RUN mkdir -p proxy-common/src simple-proxy/src simple-ipv6-proxy/src intermediat
     && echo "fn main(){}" > intermediate-proxy/src/main.rs \
     && echo "fn main(){}" > tor-proxy/src/main.rs \
     && touch proxy-common/src/lib.rs \
-    && cargo build --release --bin intermediate-proxy || true
+    && cargo build --release --bin simple-ipv6-proxy || true
 
 # Build actual code
 COPY . .
-RUN touch intermediate-proxy/src/main.rs proxy-common/src/lib.rs \
-    && cargo build --release --bin intermediate-proxy
+RUN touch simple-ipv6-proxy/src/main.rs proxy-common/src/lib.rs \
+    && cargo build --release --bin simple-ipv6-proxy
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates && mkdir -p /var/cache/acme
-COPY --from=builder /build/target/release/intermediate-proxy /usr/local/bin/
-VOLUME ["/var/cache/acme"]
-CMD ["intermediate-proxy"]
+COPY --from=builder /build/target/release/simple-ipv6-proxy /usr/local/bin/
+CMD ["simple-ipv6-proxy"]

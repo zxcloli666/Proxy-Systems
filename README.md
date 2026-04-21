@@ -3,7 +3,7 @@
 Chain of proxy servers written in Rust for routing and load-balancing HTTP requests.
 
 ```
-Client -> [Intermediate Proxy :3000] -> [Simple Proxy / Tor Proxy / Cloudflare Workers / HTTP proxy / SOCKS5 proxy]
+Client -> [Intermediate Proxy :3000] -> [Simple Proxy / Simple IPv6 Proxy / Tor Proxy / Cloudflare Workers / HTTP proxy / SOCKS5 proxy]
 ```
 
 ## Components
@@ -13,6 +13,32 @@ Client -> [Intermediate Proxy :3000] -> [Simple Proxy / Tor Proxy / Cloudflare W
 Basic reverse proxy. Receives the target URL as a base64-encoded `X-Target` header, forwards the request, and streams the response back with CORS headers. Handles redirects (relative, absolute, protocol-relative).
 
 **Port:** `8080` (env `PORT`)
+
+### simple-ipv6-proxy
+
+IPv6-only variant of `simple-proxy`. Resolves the target via AAAA records only and connects over IPv6. If the target has no IPv6 address (or all IPv6 attempts fail), it returns `502` so `intermediate-proxy` fails over to the next upstream.
+
+- **AAAA-only resolution** — IPv4 records are dropped; `502` if the target has no IPv6.
+- **Source address rotation** — when `IPV6_SUBNET` is set, each attempt binds a fresh random IPv6 from that subnet. Useful on hosts with a routed `/64` (Hetzner, OVH, etc.): each outgoing request appears from a different source IP, which beats naive per-IP blocks.
+- **Ban-aware retry** — if the target replies with a status in `RETRY_STATUS_CODES` (default `403,429`) or the connection fails, retries up to `MAX_ATTEMPTS` times; each attempt picks a new random source address and rotates through resolved AAAA records. If all attempts fail, returns `502` so the caller can fail over.
+- **SSRF guard** — literal internal / loopback / link-local / ULA / CGN / documentation IPs are rejected outright; resolved AAAA addresses are filtered the same way.
+- **IPV6_FREEBIND** — set on the outgoing socket so the kernel accepts binding to any address in a routed prefix, even if it isn't configured on a local interface.
+- **Streaming response body** — via hyper + rustls, same as `simple-proxy`.
+
+**Port:** `8080` (env `PORT`)
+
+| Env | Description | Default |
+|-----|-------------|---------|
+| `IPV6_SUBNET` | CIDR of a routed IPv6 prefix to rotate source addresses over (e.g. `2001:db8:abcd::/48`). If unset, uses the default outgoing IPv6. | — |
+| `CONNECT_TIMEOUT_MS` | TCP connect timeout per attempt | `5000` |
+| `REQUEST_TIMEOUT_MS` | HTTP request timeout per attempt | `30000` |
+| `MAX_ATTEMPTS` | Total attempts per request (retries with fresh random source on connect error or ban-status) | `3` |
+| `RETRY_STATUS_CODES` | Upstream status codes that trigger a retry | `403,429` |
+
+For subnet rotation to work:
+1. The prefix must be routed to this host (the hoster's routing, not just `ip addr add`).
+2. On Linux, either set `net.ipv6.ip_nonlocal_bind=1` or run with `CAP_NET_ADMIN`; the proxy also sets `IPV6_FREEBIND` per-socket for reliability.
+3. Container must have IPv6 enabled (Docker: `--sysctl net.ipv6.conf.all.disable_ipv6=0`, plus network configured with an IPv6 subnet).
 
 ### intermediate-proxy
 
@@ -103,12 +129,13 @@ For production set `LOG_LEVEL=warn` (or `error`). Per-request / per-upstream-att
 cargo build --release
 ```
 
-Binaries: `target/release/simple-proxy`, `target/release/intermediate-proxy`, `target/release/tor-proxy`
+Binaries: `target/release/simple-proxy`, `target/release/simple-ipv6-proxy`, `target/release/intermediate-proxy`, `target/release/tor-proxy`
 
 ## Docker
 
 ```bash
 docker build -f Dockerfile.simple-proxy -t simple-proxy .
+docker build -f Dockerfile.simple-ipv6-proxy -t simple-ipv6-proxy .
 docker build -f Dockerfile.intermediate-proxy -t intermediate-proxy .
 docker build -f Dockerfile.tor-proxy -t tor-proxy .
 ```
@@ -119,6 +146,7 @@ Push to `main` with `!release: patch`, `!release: minor`, or `!release: major` i
 
 ```
 ghcr.io/zxcloli666/proxy-systems/simple-proxy:latest
+ghcr.io/zxcloli666/proxy-systems/simple-ipv6-proxy:latest
 ghcr.io/zxcloli666/proxy-systems/intermediate-proxy:latest
 ghcr.io/zxcloli666/proxy-systems/tor-proxy:latest
 ```

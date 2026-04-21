@@ -6,10 +6,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY proxy-common/Cargo.toml proxy-common/Cargo.toml
 COPY simple-proxy/Cargo.toml simple-proxy/Cargo.toml
+COPY simple-ipv6-proxy/Cargo.toml simple-ipv6-proxy/Cargo.toml
 COPY intermediate-proxy/Cargo.toml intermediate-proxy/Cargo.toml
 COPY tor-proxy/Cargo.toml tor-proxy/Cargo.toml
-RUN mkdir -p proxy-common/src simple-proxy/src intermediate-proxy/src tor-proxy/src \
+RUN mkdir -p proxy-common/src simple-proxy/src simple-ipv6-proxy/src intermediate-proxy/src tor-proxy/src \
     && echo "fn main(){}" > simple-proxy/src/main.rs \
+    && echo "fn main(){}" > simple-ipv6-proxy/src/main.rs \
     && echo "fn main(){}" > intermediate-proxy/src/main.rs \
     && echo "fn main(){}" > tor-proxy/src/main.rs \
     && touch proxy-common/src/lib.rs \

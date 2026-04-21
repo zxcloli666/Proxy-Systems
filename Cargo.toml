@@ -1,5 +1,5 @@
 [workspace]
-members = ["proxy-common", "simple-proxy", "intermediate-proxy", "tor-proxy"]
+members = ["proxy-common", "simple-proxy", "simple-ipv6-proxy", "intermediate-proxy", "tor-proxy"]
 resolver = "2"
 
 [workspace.dependencies]

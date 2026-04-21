@@ -88,6 +88,18 @@ jobs:
             ghcr.io/${{ steps.repo.outputs.name }}/simple-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/simple-proxy:latest
 
+      - name: Build and push simple-ipv6-proxy
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.simple-ipv6-proxy
+          push: true
+          cache-from: type=gha,scope=simple-ipv6-proxy
+          cache-to: type=gha,mode=max,scope=simple-ipv6-proxy
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.name }}/simple-ipv6-proxy:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.name }}/simple-ipv6-proxy:latest
+
       - name: Build and push intermediate-proxy
         uses: docker/build-push-action@v6
         with:
