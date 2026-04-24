@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use proxy_common::cors::cors_headers;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -67,6 +67,92 @@ const SKIP_RESPONSE_HEADERS: &[&str] = &[
 /// Buffer size for the body streaming channel.
 const STREAM_CHUNK_BUFFER: usize = 64;
 
+/// Max bytes we buffer from a failed upstream response so we can potentially
+/// replay it to the client if every proxy fails.
+const FAILED_BODY_CAP: usize = 64 * 1024;
+
+/// A failed upstream response captured for "most common status" fallback.
+struct FailedResponse {
+    status: StatusCode,
+    content_type: Option<HeaderValue>,
+    body: Bytes,
+}
+
+/// Check if a reqwest response is HTML (to exclude it from failure tally).
+fn is_html_response(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            let lower = ct.to_ascii_lowercase();
+            lower.starts_with("text/html") || lower.starts_with("application/xhtml")
+        })
+        .unwrap_or(false)
+}
+
+/// Read a failed upstream response body with a hard size cap so memory usage
+/// stays bounded even if the upstream streams garbage.
+async fn buffer_failed_response(response: reqwest::Response) -> FailedResponse {
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let remaining = FAILED_BODY_CAP.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                if bytes.len() <= remaining {
+                    buf.extend_from_slice(&bytes);
+                } else {
+                    buf.extend_from_slice(&bytes[..remaining]);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    FailedResponse {
+        status,
+        content_type,
+        body: Bytes::from(buf),
+    }
+}
+
+/// Pick the most-frequent status among collected failures and build a response
+/// using one of the bodies that returned that status. Ties are broken by
+/// insertion order (first occurrence wins).
+fn build_most_common_response(failures: Vec<FailedResponse>) -> Option<Response> {
+    if failures.is_empty() {
+        return None;
+    }
+
+    let mut counts: HashMap<u16, usize> = HashMap::new();
+    for f in &failures {
+        *counts.entry(f.status.as_u16()).or_insert(0) += 1;
+    }
+    let best = counts.iter().max_by_key(|(_, c)| *c).map(|(s, _)| *s)?;
+    let pick = failures.into_iter().find(|f| f.status.as_u16() == best)?;
+
+    let mut builder = Response::builder().status(pick.status);
+    let hdrs = builder.headers_mut().unwrap();
+    for (name, value) in cors_headers() {
+        hdrs.insert(name, value);
+    }
+    if let Some(ct) = pick.content_type {
+        hdrs.insert("content-type", ct);
+    }
+    builder.body(Body::from(pick.body)).ok()
+}
+
 /// Forward a request through the proxy queue with failover and mid-stream
 /// recovery.
 pub async fn forward_with_failover(
@@ -79,6 +165,7 @@ pub async fn forward_with_failover(
     let upstream_timeout = queue.upstream_timeout();
     let mut last_error: Option<String> = None;
     let mut tried: HashSet<String> = HashSet::new();
+    let mut failures: Vec<FailedResponse> = Vec::new();
 
     for (index, entry) in snapshot.iter().enumerate() {
         tried.insert(entry.url.clone());
@@ -114,6 +201,9 @@ pub async fn forward_with_failover(
                         &format!("status {status_code}"),
                     );
                     last_error = Some(format!("status {status_code}"));
+                    if !is_html_response(response.headers()) {
+                        failures.push(buffer_failed_response(response).await);
+                    }
                     continue;
                 }
 
@@ -125,6 +215,9 @@ pub async fn forward_with_failover(
                         elapsed_ms
                     );
                     last_error = Some(format!("skipped {status_code}"));
+                    if !is_html_response(response.headers()) {
+                        failures.push(buffer_failed_response(response).await);
+                    }
                     continue;
                 }
 
@@ -183,6 +276,11 @@ pub async fn forward_with_failover(
     queue.mark_all_failed();
     let msg = last_error.unwrap_or_else(|| "all upstream proxies exhausted".to_string());
     error!("All upstream proxies failed: {}", msg);
+
+    if let Some(resp) = build_most_common_response(failures) {
+        return resp;
+    }
+
     proxy_common::response::text_response(
         StatusCode::BAD_GATEWAY,
         &format!("Proxy Error: {msg}"),
