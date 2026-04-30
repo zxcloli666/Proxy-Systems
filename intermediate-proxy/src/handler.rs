@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::queue::ProxyQueue;
-use crate::stream::forward_with_failover;
+use crate::stream::forward_dispatch;
 
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
@@ -41,5 +41,5 @@ pub async fn proxy_handler(
         snapshot.len()
     );
 
-    forward_with_failover(Arc::clone(&queue), snapshot, &method, &headers, body).await
+    forward_dispatch(Arc::clone(&queue), snapshot, &method, &headers, body).await
 }

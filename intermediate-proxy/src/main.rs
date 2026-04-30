@@ -15,7 +15,8 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::queue::{
-    DEFAULT_RESORT_INTERVAL_MS, DEFAULT_SLOW_THRESHOLD_MS, DEFAULT_UPSTREAM_TIMEOUT_MS,
+    DEFAULT_HEDGE_DELAY_MS, DEFAULT_MAX_PARALLEL_HEDGE, DEFAULT_RESORT_INTERVAL_MS,
+    DEFAULT_SLOW_THRESHOLD_MS, DEFAULT_UPSTREAM_TIMEOUT_MS,
 };
 
 #[tokio::main]
@@ -28,14 +29,19 @@ async fn main() {
     let slow_threshold_ms = env_u64("SLOW_THRESHOLD_MS", DEFAULT_SLOW_THRESHOLD_MS);
     let upstream_timeout_ms = env_u64("UPSTREAM_TIMEOUT_MS", DEFAULT_UPSTREAM_TIMEOUT_MS);
     let resort_interval_ms = env_u64("RESORT_INTERVAL_MS", DEFAULT_RESORT_INTERVAL_MS);
+    let hedge_delay_ms = env_u64("HEDGE_DELAY_MS", DEFAULT_HEDGE_DELAY_MS);
+    let max_parallel_hedge =
+        env_u64("MAX_PARALLEL_HEDGE", DEFAULT_MAX_PARALLEL_HEDGE as u64) as usize;
 
     info!(
-        "Configured: {} regular + {} reserve proxies; slow>{}ms, timeout={}ms, resort every {}ms",
+        "Configured: {} regular + {} reserve proxies; slow>{}ms, timeout={}ms, resort every {}ms, hedge delay={}ms / parallel={}",
         regular_urls.len(),
         reserve_urls.len(),
         slow_threshold_ms,
         upstream_timeout_ms,
-        resort_interval_ms
+        resort_interval_ms,
+        hedge_delay_ms,
+        max_parallel_hedge,
     );
 
     let queue = queue::ProxyQueue::new(
@@ -43,6 +49,8 @@ async fn main() {
         &reserve_urls,
         slow_threshold_ms,
         Duration::from_millis(upstream_timeout_ms),
+        Duration::from_millis(hedge_delay_ms),
+        max_parallel_hedge,
     );
 
     tokio::spawn(

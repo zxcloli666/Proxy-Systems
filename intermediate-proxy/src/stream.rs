@@ -2,13 +2,17 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::stream::BoxStream;
+use futures_util::stream::{BoxStream, FuturesUnordered};
 use futures_util::StreamExt;
 use proxy_common::cors::cors_headers;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::queue::{sanitize_url, Entry, ProxyQueue};
@@ -151,6 +155,358 @@ fn build_most_common_response(failures: Vec<FailedResponse>) -> Option<Response>
         hdrs.insert("content-type", ct);
     }
     builder.body(Body::from(pick.body)).ok()
+}
+
+/// Hedge dispatch: GET requests that don't expect strict-JSON responses are
+/// raced across multiple upstreams. Anything else stays on the sequential
+/// failover path.
+pub async fn forward_dispatch(
+    queue: Arc<ProxyQueue>,
+    snapshot: Arc<Vec<Arc<Entry>>>,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    if should_hedge(method, headers) {
+        forward_hedged(queue, snapshot, method, headers, body).await
+    } else {
+        forward_with_failover(queue, snapshot, method, headers, body).await
+    }
+}
+
+/// Hedge only when the client wants HTML/media/binary; skip JSON-only API
+/// calls so we don't multiply load on idempotency-sensitive endpoints. We
+/// only hedge GET because POST/PUT/etc. can't be safely retried in parallel.
+fn should_hedge(method: &Method, headers: &HeaderMap) -> bool {
+    if *method != Method::GET {
+        return false;
+    }
+    let Some(accept) = headers.get("accept").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let lower = accept.to_ascii_lowercase();
+    if !lower.contains("application/json") {
+        return true;
+    }
+    // Mixed Accept (browser-like) — still hedge.
+    if lower.contains("*/*")
+        || lower.contains("text/")
+        || lower.contains("audio/")
+        || lower.contains("video/")
+        || lower.contains("image/")
+        || lower.contains("application/octet-stream")
+    {
+        return true;
+    }
+    false
+}
+
+/// Result of a single upstream attempt during a hedged race.
+enum AttemptOutcome {
+    Success {
+        response: reqwest::Response,
+        entry: Arc<Entry>,
+        elapsed_ms: u64,
+    },
+    SoftFail {
+        response: reqwest::Response,
+        entry: Arc<Entry>,
+        elapsed_ms: u64,
+        status: u16,
+    },
+    Skip {
+        response: reqwest::Response,
+        entry: Arc<Entry>,
+        elapsed_ms: u64,
+        status: u16,
+    },
+    HardFail {
+        entry: Arc<Entry>,
+        err: String,
+        elapsed_ms: u64,
+        was_timeout: bool,
+    },
+}
+
+async fn attempt_one(
+    entry: Arc<Entry>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+    upstream_timeout: Duration,
+) -> AttemptOutcome {
+    debug!(
+        "→ hedge {} [{}] lat={}ms",
+        sanitize_url(&entry.url),
+        entry.tier().as_str(),
+        entry.avg_latency_ms.load(Ordering::Relaxed)
+    );
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        upstream_timeout,
+        send_to_upstream(&entry.upstream, &method, &headers, body, None),
+    )
+    .await;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    match result {
+        Ok(Ok(response)) => {
+            let status = response.status().as_u16();
+            if RATE_LIMIT_CODES.contains(&status) {
+                AttemptOutcome::SoftFail {
+                    response,
+                    entry,
+                    elapsed_ms,
+                    status,
+                }
+            } else if SKIP_CODES.contains(&status) {
+                AttemptOutcome::Skip {
+                    response,
+                    entry,
+                    elapsed_ms,
+                    status,
+                }
+            } else {
+                AttemptOutcome::Success {
+                    response,
+                    entry,
+                    elapsed_ms,
+                }
+            }
+        }
+        Ok(Err(e)) => AttemptOutcome::HardFail {
+            entry,
+            err: e.to_string(),
+            elapsed_ms,
+            was_timeout: false,
+        },
+        Err(_) => AttemptOutcome::HardFail {
+            entry,
+            err: format!("timeout {}ms", upstream_timeout.as_millis()),
+            elapsed_ms,
+            was_timeout: true,
+        },
+    }
+}
+
+type AttemptFuture = Pin<Box<dyn Future<Output = AttemptOutcome> + Send>>;
+
+/// Pull the next untried entry from the snapshot and push an attempt into
+/// `futures`. Returns true if an attempt was launched.
+#[allow(clippy::too_many_arguments)]
+fn launch_attempt(
+    futures: &mut FuturesUnordered<AttemptFuture>,
+    tried: &mut HashSet<String>,
+    snapshot: &Arc<Vec<Arc<Entry>>>,
+    next_idx: &mut usize,
+    method: &Method,
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_timeout: Duration,
+) -> bool {
+    while *next_idx < snapshot.len() {
+        let entry = snapshot[*next_idx].clone();
+        *next_idx += 1;
+        if !tried.insert(entry.url.clone()) {
+            continue;
+        }
+        let m = method.clone();
+        let h = headers.clone();
+        let b = body.clone();
+        futures.push(Box::pin(attempt_one(entry, m, h, b, upstream_timeout)));
+        return true;
+    }
+    false
+}
+
+/// Hedged failover: launch attempts in parallel, first non-failure response
+/// wins, others get cancelled. Bounded parallelism prevents fan-out blow-up
+/// when most upstreams are healthy.
+async fn forward_hedged(
+    queue: Arc<ProxyQueue>,
+    snapshot: Arc<Vec<Arc<Entry>>>,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    let upstream_timeout = queue.upstream_timeout();
+    let hedge_delay = queue.hedge_delay();
+    let max_parallel = queue.max_parallel_hedge();
+
+    let mut futures: FuturesUnordered<AttemptFuture> = FuturesUnordered::new();
+    let mut tried: HashSet<String> = HashSet::new();
+    let mut buffering: Vec<JoinHandle<FailedResponse>> = Vec::new();
+    let mut last_error: Option<String> = None;
+    let mut next_idx: usize = 0;
+
+    let _ = launch_attempt(
+        &mut futures,
+        &mut tried,
+        &snapshot,
+        &mut next_idx,
+        method,
+        headers,
+        &body,
+        upstream_timeout,
+    );
+
+    let timer = tokio::time::sleep(hedge_delay);
+    tokio::pin!(timer);
+
+    while !futures.is_empty() {
+        tokio::select! {
+            biased;
+            Some(outcome) = futures.next() => {
+                match outcome {
+                    AttemptOutcome::Success { response, entry, elapsed_ms } => {
+                        debug!(
+                            "hedge winner {} success {} in {}ms",
+                            sanitize_url(&entry.url),
+                            response.status().as_u16(),
+                            elapsed_ms
+                        );
+                        queue.record_success(&entry, elapsed_ms);
+                        let used_index = snapshot
+                            .iter()
+                            .position(|e| Arc::ptr_eq(e, &entry))
+                            .unwrap_or(0);
+                        // Cancel buffering tasks — we don't need their bodies.
+                        for h in &buffering {
+                            h.abort();
+                        }
+                        let can_recover =
+                            *method == Method::GET && can_recover_stream(headers, &response);
+                        // Dropping `futures` here cancels every other in-flight
+                        // attempt; reqwest aborts the underlying connections.
+                        drop(futures);
+                        return build_streaming_response(
+                            response,
+                            queue.clone(),
+                            snapshot.clone(),
+                            used_index,
+                            method,
+                            headers,
+                            &body,
+                            can_recover,
+                            tried,
+                        )
+                        .await;
+                    }
+                    AttemptOutcome::SoftFail { response, entry, elapsed_ms, status } => {
+                        debug!(
+                            "hedge {} replied {} in {}ms (soft-fail)",
+                            sanitize_url(&entry.url),
+                            status,
+                            elapsed_ms
+                        );
+                        queue.record_soft_error(
+                            &entry,
+                            elapsed_ms,
+                            &format!("status {status}"),
+                        );
+                        last_error = Some(format!("status {status}"));
+                        if !is_html_response(response.headers()) {
+                            buffering.push(tokio::spawn(buffer_failed_response(response)));
+                        }
+                        launch_attempt(
+                            &mut futures,
+                            &mut tried,
+                            &snapshot,
+                            &mut next_idx,
+                            method,
+                            headers,
+                            &body,
+                            upstream_timeout,
+                        );
+                    }
+                    AttemptOutcome::Skip { response, entry, elapsed_ms, status } => {
+                        debug!(
+                            "hedge {} skip code {} in {}ms",
+                            sanitize_url(&entry.url),
+                            status,
+                            elapsed_ms
+                        );
+                        last_error = Some(format!("skipped {status}"));
+                        if !is_html_response(response.headers()) {
+                            buffering.push(tokio::spawn(buffer_failed_response(response)));
+                        }
+                        launch_attempt(
+                            &mut futures,
+                            &mut tried,
+                            &snapshot,
+                            &mut next_idx,
+                            method,
+                            headers,
+                            &body,
+                            upstream_timeout,
+                        );
+                    }
+                    AttemptOutcome::HardFail { entry, err, elapsed_ms, was_timeout } => {
+                        if was_timeout {
+                            warn!(
+                                "upstream {} timed out after {}ms",
+                                sanitize_url(&entry.url),
+                                elapsed_ms
+                            );
+                        } else {
+                            warn!(
+                                "upstream {} connection error in {}ms: {}",
+                                sanitize_url(&entry.url),
+                                elapsed_ms,
+                                err
+                            );
+                        }
+                        queue.record_hard_error(&entry, &err);
+                        last_error = Some(err);
+                        launch_attempt(
+                            &mut futures,
+                            &mut tried,
+                            &snapshot,
+                            &mut next_idx,
+                            method,
+                            headers,
+                            &body,
+                            upstream_timeout,
+                        );
+                    }
+                }
+            }
+            _ = &mut timer => {
+                timer.as_mut().reset(tokio::time::Instant::now() + hedge_delay);
+                if futures.len() < max_parallel {
+                    launch_attempt(
+                        &mut futures,
+                        &mut tried,
+                        &snapshot,
+                        &mut next_idx,
+                        method,
+                        headers,
+                        &body,
+                        upstream_timeout,
+                    );
+                }
+            }
+        }
+    }
+
+    // Exhausted: collect whatever bodies finished buffering for the
+    // most-common-status fallback.
+    let mut failures: Vec<FailedResponse> = Vec::new();
+    for handle in buffering {
+        if let Ok(fr) = handle.await {
+            failures.push(fr);
+        }
+    }
+
+    queue.mark_all_failed();
+    let msg = last_error.unwrap_or_else(|| "all upstream proxies exhausted".to_string());
+    error!("All upstream proxies failed (hedged): {}", msg);
+    if let Some(resp) = build_most_common_response(failures) {
+        return resp;
+    }
+    proxy_common::response::text_response(
+        StatusCode::BAD_GATEWAY,
+        &format!("Proxy Error: {msg}"),
+    )
 }
 
 /// Forward a request through the proxy queue with failover and mid-stream

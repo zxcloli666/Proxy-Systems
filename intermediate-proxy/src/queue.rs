@@ -11,6 +11,8 @@ use crate::upstream::{parse_upstream, Upstream};
 pub const DEFAULT_SLOW_THRESHOLD_MS: u64 = 3000;
 pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_RESORT_INTERVAL_MS: u64 = 2_000;
+pub const DEFAULT_HEDGE_DELAY_MS: u64 = 700;
+pub const DEFAULT_MAX_PARALLEL_HEDGE: usize = 4;
 
 const FAILED_STREAK: u32 = 2;
 const EWMA_NUM: u64 = 3;
@@ -147,6 +149,8 @@ pub struct ProxyQueue {
     regular_count: usize,
     slow_threshold_ms: u64,
     upstream_timeout: Duration,
+    hedge_delay: Duration,
+    max_parallel_hedge: usize,
     dirty: AtomicBool,
     all_failed: AtomicBool,
     notify: Notify,
@@ -158,6 +162,8 @@ impl ProxyQueue {
         reserve_urls: &[String],
         slow_threshold_ms: u64,
         upstream_timeout: Duration,
+        hedge_delay: Duration,
+        max_parallel_hedge: usize,
     ) -> Arc<Self> {
         let mut entries = Vec::with_capacity(regular_urls.len() + reserve_urls.len());
         for url in regular_urls {
@@ -173,6 +179,8 @@ impl ProxyQueue {
             snapshot,
             slow_threshold_ms,
             upstream_timeout,
+            hedge_delay,
+            max_parallel_hedge: max_parallel_hedge.max(1),
             dirty: AtomicBool::new(false),
             all_failed: AtomicBool::new(false),
             notify: Notify::new(),
@@ -187,6 +195,16 @@ impl ProxyQueue {
     #[inline]
     pub fn upstream_timeout(&self) -> Duration {
         self.upstream_timeout
+    }
+
+    #[inline]
+    pub fn hedge_delay(&self) -> Duration {
+        self.hedge_delay
+    }
+
+    #[inline]
+    pub fn max_parallel_hedge(&self) -> usize {
+        self.max_parallel_hedge
     }
 
     pub fn record_success(&self, entry: &Entry, latency_ms: u64) {
