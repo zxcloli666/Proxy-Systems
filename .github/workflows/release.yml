@@ -76,14 +76,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Все 4 образа собираются из одного Dockerfile, шарят builder-стейдж
+      # через единый gha cache scope=workspace — на холодном кэше workspace
+      # компилится один раз, остальные 3 шага хитят кэш и тратят секунды
+      # на финальный COPY.
+
       - name: Build and push simple-proxy
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.simple-proxy
+          file: Dockerfile
+          target: simple-proxy
           push: true
-          cache-from: type=gha,scope=simple-proxy
-          cache-to: type=gha,mode=max,scope=simple-proxy
+          cache-from: type=gha,scope=workspace
+          cache-to: type=gha,mode=max,scope=workspace
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/simple-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/simple-proxy:latest
@@ -92,10 +98,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.simple-ipv6-proxy
+          file: Dockerfile
+          target: simple-ipv6-proxy
           push: true
-          cache-from: type=gha,scope=simple-ipv6-proxy
-          cache-to: type=gha,mode=max,scope=simple-ipv6-proxy
+          cache-from: type=gha,scope=workspace
+          cache-to: type=gha,mode=max,scope=workspace
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/simple-ipv6-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/simple-ipv6-proxy:latest
@@ -104,10 +111,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.intermediate-proxy
+          file: Dockerfile
+          target: intermediate-proxy
           push: true
-          cache-from: type=gha,scope=intermediate-proxy
-          cache-to: type=gha,mode=max,scope=intermediate-proxy
+          cache-from: type=gha,scope=workspace
+          cache-to: type=gha,mode=max,scope=workspace
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/intermediate-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/intermediate-proxy:latest
@@ -116,10 +124,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.tor-proxy
+          file: Dockerfile
+          target: tor-proxy
           push: true
-          cache-from: type=gha,scope=tor-proxy
-          cache-to: type=gha,mode=max,scope=tor-proxy
+          cache-from: type=gha,scope=workspace
+          cache-to: type=gha,mode=max,scope=workspace
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/tor-proxy:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/tor-proxy:latest

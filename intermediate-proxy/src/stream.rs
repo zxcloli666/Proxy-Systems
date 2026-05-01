@@ -82,6 +82,31 @@ struct FailedResponse {
     body: Bytes,
 }
 
+/// Walk the `source()` chain of a reqwest error and join all the underlying
+/// causes into a single dense string. reqwest's top-level Display is just
+/// "error sending request for url (...)" — useless on its own; the actual
+/// reason (Connection refused / dns resolution failed / handshake failure /
+/// connection reset / etc.) lives in the chain.
+fn describe_reqwest_error(err: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&dyn Error> = Some(err as &dyn Error);
+    while let Some(e) = current {
+        let s = e.to_string();
+        if !parts.iter().any(|p| p == &s) {
+            parts.push(s);
+        }
+        current = e.source();
+    }
+    // The first layer is reqwest's own "error sending request for url ..."
+    // which only echoes the URL we already log; drop it if a deeper cause is
+    // available so the reason field carries the real signal.
+    if parts.len() > 1 {
+        parts.remove(0);
+    }
+    parts.join(" → ")
+}
+
 /// Check if a reqwest response is HTML (to exclude it from failure tally).
 fn is_html_response(headers: &reqwest::header::HeaderMap) -> bool {
     headers
@@ -275,7 +300,7 @@ async fn attempt_one(
         }
         Ok(Err(e)) => AttemptOutcome::HardFail {
             entry,
-            err: e.to_string(),
+            err: describe_reqwest_error(&e),
             elapsed_ms,
             was_timeout: false,
         },
@@ -602,14 +627,15 @@ pub async fn forward_with_failover(
                 .await;
             }
             Ok(Err(e)) => {
+                let reason = describe_reqwest_error(&e);
                 warn!(
                     "upstream {} connection error in {}ms: {}",
                     sanitize_url(&entry.url),
                     elapsed_ms,
-                    e
+                    reason
                 );
-                queue.record_hard_error(entry, &format!("{e}"));
-                last_error = Some(format!("{e}"));
+                queue.record_hard_error(entry, &reason);
+                last_error = Some(reason);
             }
             Err(_) => {
                 warn!(
@@ -713,21 +739,22 @@ async fn build_streaming_response(
                     }
                 }
                 Some(Err(e)) => {
+                    let reason = describe_reqwest_error(&e);
                     error!(
                         "stream error on {} after {} bytes: {}",
                         sanitize_url(&current_url),
                         total_bytes,
-                        e
+                        reason
                     );
 
                     if !can_recover {
-                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                        let _ = tx.send(Err(std::io::Error::other(reason))).await;
                         return;
                     }
 
                     queue.record_hard_error_url(
                         &current_url,
-                        &format!("stream error: {e}"),
+                        &format!("stream error: {reason}"),
                     );
 
                     info!(
@@ -861,13 +888,14 @@ async fn build_streaming_response(
                                 }
                             }
                             Ok(Err(re)) => {
+                                let reason = describe_reqwest_error(&re);
                                 warn!(
                                     "recovery: {} connection failed in {}ms: {}",
                                     sanitize_url(&next.url),
                                     elapsed_ms,
-                                    re
+                                    reason
                                 );
-                                queue.record_hard_error(next, &format!("recovery: {re}"));
+                                queue.record_hard_error(next, &format!("recovery: {reason}"));
                             }
                             Err(_) => {
                                 warn!(

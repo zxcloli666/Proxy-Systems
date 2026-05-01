@@ -133,12 +133,18 @@ Binaries: `target/release/simple-proxy`, `target/release/simple-ipv6-proxy`, `ta
 
 ## Docker
 
+Один общий `Dockerfile` с multi-stage targets — workspace компилится один раз
+для любой комбинации из четырёх бинарей:
+
 ```bash
-docker build -f Dockerfile.simple-proxy -t simple-proxy .
-docker build -f Dockerfile.simple-ipv6-proxy -t simple-ipv6-proxy .
-docker build -f Dockerfile.intermediate-proxy -t intermediate-proxy .
-docker build -f Dockerfile.tor-proxy -t tor-proxy .
+DOCKER_BUILDKIT=1 docker build --target simple-proxy        -t simple-proxy        .
+DOCKER_BUILDKIT=1 docker build --target simple-ipv6-proxy   -t simple-ipv6-proxy   .
+DOCKER_BUILDKIT=1 docker build --target intermediate-proxy  -t intermediate-proxy  .
+DOCKER_BUILDKIT=1 docker build --target tor-proxy           -t tor-proxy           .
 ```
+
+> BuildKit нужен из-за `--mount=type=cache` для cargo registry. На современных
+> Docker Engine BuildKit включён по умолчанию.
 
 ## Release
 
