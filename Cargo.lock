@@ -1011,6 +1011,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "axum-server",
+ "base64",
  "bytes",
  "futures-util",
  "http",

@@ -63,8 +63,12 @@ Smart router with automatic failover, latency-aware tier ordering, and lock-free
 | `SLOW_THRESHOLD_MS` | EWMA latency above this demotes a proxy to the `slow` tier | `3000` |
 | `UPSTREAM_TIMEOUT_MS` | Per-attempt time-to-first-byte timeout | `10000` |
 | `RESORT_INTERVAL_MS` | Max delay between queue re-sorts when stats change | `2000` |
+| `FATAL_PROBE_URL` | URL the prober hits to recover regular proxies stuck in the `fatal` tier (set empty to disable) | `https://www.google.com/generate_204` |
+| `FATAL_PROBE_INTERVAL_MS` | How often the prober tests fatal regular proxies (set `0` to disable) | `10000` |
 
-`GET /health` returns per-proxy tier, average / last latency, success/error counts, consecutive failures, last error reason, plus tier totals.
+A regular proxy that fails with a connect-class hard error (`client error (Connect) → ...` or `timeout`) is moved to the `fatal` tier and excluded from dispatch. The background prober periodically issues a request through it to `FATAL_PROBE_URL`; any HTTP response (regardless of status) restores it. Reserve proxies are never marked fatal.
+
+`GET /health` returns per-proxy tier (including `fatal` with `fatalSinceMs` / `fatalCount`), average / last latency, success/error counts, consecutive failures, last error reason, plus tier totals and prober config under `fatalProbe`.
 
 #### Built-in TLS (Let's Encrypt)
 

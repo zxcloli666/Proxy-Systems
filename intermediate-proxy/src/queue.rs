@@ -13,6 +13,8 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_RESORT_INTERVAL_MS: u64 = 2_000;
 pub const DEFAULT_HEDGE_DELAY_MS: u64 = 700;
 pub const DEFAULT_MAX_PARALLEL_HEDGE: usize = 4;
+pub const DEFAULT_FATAL_PROBE_INTERVAL_MS: u64 = 10_000;
+pub const DEFAULT_FATAL_PROBE_URL: &str = "https://www.google.com/generate_204";
 
 const FAILED_STREAK: u32 = 2;
 const EWMA_NUM: u64 = 3;
@@ -24,6 +26,7 @@ pub enum Tier {
     Healthy = 0,
     Slow = 1,
     Failed = 2,
+    Fatal = 3,
 }
 
 impl Tier {
@@ -32,8 +35,13 @@ impl Tier {
             Tier::Healthy => "healthy",
             Tier::Slow => "slow",
             Tier::Failed => "failed",
+            Tier::Fatal => "fatal",
         }
     }
+}
+
+pub fn is_fatal_reason(reason: &str) -> bool {
+    reason.contains("client error (Connect)") || reason.starts_with("timeout ")
 }
 
 pub struct Entry {
@@ -52,6 +60,9 @@ pub struct Entry {
     pub last_success_ms: AtomicU64,
     pub last_error_ms: AtomicU64,
     pub last_error_reason: Mutex<Option<String>>,
+    pub fatal: AtomicBool,
+    pub fatal_since_ms: AtomicU64,
+    pub fatal_count: AtomicU64,
 }
 
 impl Entry {
@@ -71,10 +82,16 @@ impl Entry {
             last_success_ms: AtomicU64::new(0),
             last_error_ms: AtomicU64::new(0),
             last_error_reason: Mutex::new(None),
+            fatal: AtomicBool::new(false),
+            fatal_since_ms: AtomicU64::new(0),
+            fatal_count: AtomicU64::new(0),
         }
     }
 
     pub fn tier(&self) -> Tier {
+        if self.fatal.load(Ordering::Relaxed) {
+            return Tier::Fatal;
+        }
         if self.consecutive_failures.load(Ordering::Relaxed) >= FAILED_STREAK {
             return Tier::Failed;
         }
@@ -83,6 +100,28 @@ impl Entry {
             return Tier::Slow;
         }
         Tier::Healthy
+    }
+
+    pub fn mark_fatal(&self) -> bool {
+        let was = self.fatal.swap(true, Ordering::Relaxed);
+        if !was {
+            self.fatal_since_ms.store(now_ms(), Ordering::Relaxed);
+            self.fatal_count.fetch_add(1, Ordering::Relaxed);
+        }
+        !was
+    }
+
+    pub fn clear_fatal(&self) -> bool {
+        let was = self.fatal.swap(false, Ordering::Relaxed);
+        if was {
+            self.fatal_since_ms.store(0, Ordering::Relaxed);
+            self.consecutive_failures.store(0, Ordering::Relaxed);
+        }
+        was
+    }
+
+    pub fn set_last_error_reason(&self, reason: &str) {
+        self.record_reason(reason);
     }
 
     fn blend_latency(&self, sample_ms: u64) {
@@ -115,6 +154,7 @@ impl Entry {
         self.last_success_ms.store(now_ms(), Ordering::Relaxed);
         self.last_latency_ms.store(latency_ms, Ordering::Relaxed);
         self.blend_latency(latency_ms);
+        self.clear_fatal();
     }
 
     /// Upstream answered but with a retryable bad status (429/500/...).
@@ -151,6 +191,8 @@ pub struct ProxyQueue {
     upstream_timeout: Duration,
     hedge_delay: Duration,
     max_parallel_hedge: usize,
+    fatal_probe_url: String,
+    fatal_probe_interval: Duration,
     dirty: AtomicBool,
     all_failed: AtomicBool,
     notify: Notify,
@@ -164,6 +206,8 @@ impl ProxyQueue {
         upstream_timeout: Duration,
         hedge_delay: Duration,
         max_parallel_hedge: usize,
+        fatal_probe_url: String,
+        fatal_probe_interval: Duration,
     ) -> Arc<Self> {
         let mut entries = Vec::with_capacity(regular_urls.len() + reserve_urls.len());
         for url in regular_urls {
@@ -181,10 +225,39 @@ impl ProxyQueue {
             upstream_timeout,
             hedge_delay,
             max_parallel_hedge: max_parallel_hedge.max(1),
+            fatal_probe_url,
+            fatal_probe_interval,
             dirty: AtomicBool::new(false),
             all_failed: AtomicBool::new(false),
             notify: Notify::new(),
         })
+    }
+
+    #[inline]
+    pub fn fatal_probe_url(&self) -> &str {
+        &self.fatal_probe_url
+    }
+
+    #[inline]
+    pub fn fatal_probe_interval(&self) -> Duration {
+        self.fatal_probe_interval
+    }
+
+    pub fn fatal_regulars(&self) -> Vec<Arc<Entry>> {
+        self.entries
+            .iter()
+            .filter(|e| !e.is_reserve && e.fatal.load(Ordering::Relaxed))
+            .cloned()
+            .collect()
+    }
+
+    pub fn clear_entry_fatal(&self, entry: &Entry) -> bool {
+        let cleared = entry.clear_fatal();
+        if cleared {
+            self.all_failed.store(false, Ordering::Relaxed);
+            self.schedule_resort();
+        }
+        cleared
     }
 
     #[inline]
@@ -227,6 +300,13 @@ impl ProxyQueue {
     pub fn record_hard_error(&self, entry: &Entry, reason: &str) {
         let before = entry.tier();
         entry.observe_hard_error(reason);
+        if !entry.is_reserve && is_fatal_reason(reason) && entry.mark_fatal() {
+            tracing::warn!(
+                "marking {} fatal: {}",
+                sanitize_url(&entry.url),
+                reason
+            );
+        }
         if before != entry.tier() {
             self.schedule_resort();
         }
@@ -322,7 +402,7 @@ impl ProxyQueue {
         let snap = self.snapshot.load();
         let mut regular = Vec::new();
         let mut reserve = Vec::new();
-        let mut tier_counts = [0u64; 3];
+        let mut tier_counts = [0u64; 4];
         for (i, entry) in snap.iter().enumerate() {
             tier_counts[entry.tier() as usize] += 1;
             let j = entry_json(i, entry);
@@ -332,6 +412,16 @@ impl ProxyQueue {
                 regular.push(j);
             }
         }
+
+        let probe = if self.fatal_probe_url.is_empty() || self.fatal_probe_interval.is_zero() {
+            serde_json::json!({ "enabled": false })
+        } else {
+            serde_json::json!({
+                "enabled": true,
+                "url": self.fatal_probe_url,
+                "intervalMs": self.fatal_probe_interval.as_millis() as u64,
+            })
+        };
 
         serde_json::json!({
             "status": "ok",
@@ -343,7 +433,9 @@ impl ProxyQueue {
                 "healthy": tier_counts[0],
                 "slow": tier_counts[1],
                 "failed": tier_counts[2],
+                "fatal": tier_counts[3],
             },
+            "fatalProbe": probe,
             "regular": {
                 "total": self.regular_count,
                 "proxies": regular,
@@ -377,6 +469,9 @@ fn entry_json(position: usize, e: &Entry) -> serde_json::Value {
         "lastSuccessMs": e.last_success_ms.load(Ordering::Relaxed),
         "lastErrorMs": e.last_error_ms.load(Ordering::Relaxed),
         "lastErrorReason": reason,
+        "fatal": e.fatal.load(Ordering::Relaxed),
+        "fatalSinceMs": e.fatal_since_ms.load(Ordering::Relaxed),
+        "fatalCount": e.fatal_count.load(Ordering::Relaxed),
     })
 }
 

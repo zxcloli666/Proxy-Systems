@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::queue::{sanitize_url, Entry, ProxyQueue};
+use crate::queue::{sanitize_url, Entry, ProxyQueue, Tier};
 use crate::upstream::Upstream;
 
 /// Status codes that trigger failover to the next proxy.
@@ -87,7 +87,7 @@ struct FailedResponse {
 /// "error sending request for url (...)" — useless on its own; the actual
 /// reason (Connection refused / dns resolution failed / handshake failure /
 /// connection reset / etc.) lives in the chain.
-fn describe_reqwest_error(err: &reqwest::Error) -> String {
+pub(crate) fn describe_reqwest_error(err: &reqwest::Error) -> String {
     use std::error::Error;
     let mut parts: Vec<String> = Vec::new();
     let mut current: Option<&dyn Error> = Some(err as &dyn Error);
@@ -331,6 +331,9 @@ fn launch_attempt(
     while *next_idx < snapshot.len() {
         let entry = snapshot[*next_idx].clone();
         *next_idx += 1;
+        if entry.tier() == Tier::Fatal {
+            continue;
+        }
         if !tried.insert(entry.url.clone()) {
             continue;
         }
@@ -549,6 +552,9 @@ pub async fn forward_with_failover(
     let mut failures: Vec<FailedResponse> = Vec::new();
 
     for (index, entry) in snapshot.iter().enumerate() {
+        if entry.tier() == Tier::Fatal {
+            continue;
+        }
         tried.insert(entry.url.clone());
         debug!(
             "→ upstream {} [{}] lat={}ms",
@@ -769,6 +775,9 @@ async fn build_streaming_response(
                     let mut recovered = false;
 
                     for next in live.iter() {
+                        if next.tier() == Tier::Fatal {
+                            continue;
+                        }
                         if !tried.insert(next.url.clone()) {
                             continue;
                         }
@@ -925,7 +934,7 @@ async fn build_streaming_response(
 }
 
 /// Dispatch a single upstream request based on the upstream kind.
-async fn send_to_upstream(
+pub(crate) async fn send_to_upstream(
     upstream: &Upstream,
     method: &Method,
     headers: &HeaderMap,

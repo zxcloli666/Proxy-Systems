@@ -1,5 +1,6 @@
 mod handler;
 mod health;
+mod probe;
 mod queue;
 mod stream;
 mod tls;
@@ -15,8 +16,9 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::queue::{
-    DEFAULT_HEDGE_DELAY_MS, DEFAULT_MAX_PARALLEL_HEDGE, DEFAULT_RESORT_INTERVAL_MS,
-    DEFAULT_SLOW_THRESHOLD_MS, DEFAULT_UPSTREAM_TIMEOUT_MS,
+    DEFAULT_FATAL_PROBE_INTERVAL_MS, DEFAULT_FATAL_PROBE_URL, DEFAULT_HEDGE_DELAY_MS,
+    DEFAULT_MAX_PARALLEL_HEDGE, DEFAULT_RESORT_INTERVAL_MS, DEFAULT_SLOW_THRESHOLD_MS,
+    DEFAULT_UPSTREAM_TIMEOUT_MS,
 };
 
 #[tokio::main]
@@ -32,9 +34,13 @@ async fn main() {
     let hedge_delay_ms = env_u64("HEDGE_DELAY_MS", DEFAULT_HEDGE_DELAY_MS);
     let max_parallel_hedge =
         env_u64("MAX_PARALLEL_HEDGE", DEFAULT_MAX_PARALLEL_HEDGE as u64) as usize;
+    let fatal_probe_interval_ms =
+        env_u64("FATAL_PROBE_INTERVAL_MS", DEFAULT_FATAL_PROBE_INTERVAL_MS);
+    let fatal_probe_url = std::env::var("FATAL_PROBE_URL")
+        .unwrap_or_else(|_| DEFAULT_FATAL_PROBE_URL.to_string());
 
     info!(
-        "Configured: {} regular + {} reserve proxies; slow>{}ms, timeout={}ms, resort every {}ms, hedge delay={}ms / parallel={}",
+        "Configured: {} regular + {} reserve proxies; slow>{}ms, timeout={}ms, resort every {}ms, hedge delay={}ms / parallel={}, fatal probe every {}ms → {}",
         regular_urls.len(),
         reserve_urls.len(),
         slow_threshold_ms,
@@ -42,6 +48,8 @@ async fn main() {
         resort_interval_ms,
         hedge_delay_ms,
         max_parallel_hedge,
+        fatal_probe_interval_ms,
+        if fatal_probe_url.is_empty() { "<disabled>" } else { fatal_probe_url.as_str() },
     );
 
     let queue = queue::ProxyQueue::new(
@@ -51,11 +59,14 @@ async fn main() {
         Duration::from_millis(upstream_timeout_ms),
         Duration::from_millis(hedge_delay_ms),
         max_parallel_hedge,
+        fatal_probe_url,
+        Duration::from_millis(fatal_probe_interval_ms),
     );
 
     tokio::spawn(
         Arc::clone(&queue).run_resorter(Duration::from_millis(resort_interval_ms)),
     );
+    tokio::spawn(probe::run_fatal_prober(Arc::clone(&queue)));
 
     let app = Router::new()
         .route("/health", get(health::health_handler))
