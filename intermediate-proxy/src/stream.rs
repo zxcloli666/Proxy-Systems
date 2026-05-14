@@ -525,6 +525,21 @@ async fn forward_hedged(
         }
     }
 
+    if let Some(resp) = try_fatal_proxies(
+        &queue,
+        &snapshot,
+        method,
+        headers,
+        &body,
+        &tried,
+        &mut failures,
+        &mut last_error,
+    )
+    .await
+    {
+        return resp;
+    }
+
     queue.mark_all_failed();
     let msg = last_error.unwrap_or_else(|| "all upstream proxies exhausted".to_string());
     error!("All upstream proxies failed (hedged): {}", msg);
@@ -661,6 +676,21 @@ pub async fn forward_with_failover(
         }
     }
 
+    if let Some(resp) = try_fatal_proxies(
+        &queue,
+        &snapshot,
+        method,
+        headers,
+        &body,
+        &tried,
+        &mut failures,
+        &mut last_error,
+    )
+    .await
+    {
+        return resp;
+    }
+
     queue.mark_all_failed();
     let msg = last_error.unwrap_or_else(|| "all upstream proxies exhausted".to_string());
     error!("All upstream proxies failed: {}", msg);
@@ -673,6 +703,107 @@ pub async fn forward_with_failover(
         StatusCode::BAD_GATEWAY,
         &format!("Proxy Error: {msg}"),
     )
+}
+
+/// Last-resort attempt over entries currently marked fatal that weren't
+/// tried this request. Does NOT touch queue/entry state — fatal proxies
+/// stay fatal regardless of outcome on this request, and recovery is
+/// disabled so the streaming task is also mutation-free.
+#[allow(clippy::too_many_arguments)]
+async fn try_fatal_proxies(
+    queue: &Arc<ProxyQueue>,
+    snapshot: &Arc<Vec<Arc<Entry>>>,
+    method: &Method,
+    headers: &HeaderMap,
+    body: &Bytes,
+    tried: &HashSet<String>,
+    failures: &mut Vec<FailedResponse>,
+    last_error: &mut Option<String>,
+) -> Option<Response> {
+    let upstream_timeout = queue.upstream_timeout();
+    for (index, entry) in snapshot.iter().enumerate() {
+        if entry.tier() != Tier::Fatal {
+            continue;
+        }
+        if tried.contains(&entry.url) {
+            continue;
+        }
+        warn!(
+            "fatal fallback: trying {} (no live proxies left)",
+            sanitize_url(&entry.url)
+        );
+
+        let start = Instant::now();
+        let result = tokio::time::timeout(
+            upstream_timeout,
+            send_to_upstream(&entry.upstream, method, headers, body.clone(), None),
+        )
+        .await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        match result {
+            Ok(Ok(response)) => {
+                let status_code = response.status().as_u16();
+
+                if RATE_LIMIT_CODES.contains(&status_code) {
+                    *last_error = Some(format!("status {status_code}"));
+                    if !is_html_response(response.headers()) {
+                        failures.push(buffer_failed_response(response).await);
+                    }
+                    continue;
+                }
+
+                if SKIP_CODES.contains(&status_code) {
+                    *last_error = Some(format!("skipped {status_code}"));
+                    if !is_html_response(response.headers()) {
+                        failures.push(buffer_failed_response(response).await);
+                    }
+                    continue;
+                }
+
+                warn!(
+                    "fatal fallback: {} returned {} in {}ms",
+                    sanitize_url(&entry.url),
+                    status_code,
+                    elapsed_ms
+                );
+
+                return Some(
+                    build_streaming_response(
+                        response,
+                        queue.clone(),
+                        snapshot.clone(),
+                        index,
+                        method,
+                        headers,
+                        body,
+                        false,
+                        tried.clone(),
+                    )
+                    .await,
+                );
+            }
+            Ok(Err(e)) => {
+                let reason = describe_reqwest_error(&e);
+                debug!(
+                    "fatal fallback: {} still failing in {}ms: {}",
+                    sanitize_url(&entry.url),
+                    elapsed_ms,
+                    reason
+                );
+                *last_error = Some(reason);
+            }
+            Err(_) => {
+                debug!(
+                    "fatal fallback: {} timed out after {}ms",
+                    sanitize_url(&entry.url),
+                    upstream_timeout.as_millis()
+                );
+                *last_error = Some(format!("timeout after {}ms", upstream_timeout.as_millis()));
+            }
+        }
+    }
+    None
 }
 
 /// Check if the stream can be resumed against another proxy on mid-stream
