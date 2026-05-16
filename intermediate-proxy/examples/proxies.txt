@@ -1,0 +1,23 @@
+# intermediate-proxy proxy list — hot-reloaded on mtime change.
+#
+# One proxy per line:
+#   <url>  tags=a,b,c
+#   <url>  bare-tag another-tag
+#
+# First whitespace token is the URL; the rest are tags (the `tags=` prefix is
+# optional). Blank lines and `#` comments are ignored. Duplicate URLs merge
+# their tags. The special tag `reserve` marks a proxy only used when every
+# non-reserve proxy for the route is unavailable.
+#
+# URL schemes:
+#   http:// | https://    forward via X-Target header to a worker endpoint
+#   forward://host:port    HTTP forward proxy (request goes direct to target)
+#   socks5://host:port     SOCKS5 proxy
+
+https://worker-a.example.workers.dev   tags=anon,worker
+https://worker-b.example.workers.dev   tags=anon,worker
+socks5://user:pass@dc1.example.com:1080 tags=datacenter,us
+socks5://user:pass@dc2.example.com:1080 tags=datacenter,eu
+forward://res1.example.com:3128         tags=residential,us
+forward://res2.example.com:3128         tags=residential,eu
+socks5://backup.example.com:1080        tags=reserve

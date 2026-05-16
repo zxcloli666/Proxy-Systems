@@ -21,3 +21,10 @@ base64 = { workspace = true }
 rustls = { workspace = true }
 rustls-acme = { workspace = true }
 axum-server = { workspace = true }
+mlua = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
+smallvec = { workspace = true }
+fastrand = { workspace = true }
+ahash = { workspace = true }

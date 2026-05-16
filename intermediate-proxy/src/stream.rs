@@ -2,50 +2,37 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::stream::{BoxStream, FuturesUnordered};
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use proxy_common::cors::cors_headers;
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use crate::queue::{sanitize_url, Entry, ProxyQueue, Tier};
-use crate::upstream::Upstream;
+use crate::forward::{describe_reqwest_error, send_to_upstream};
+use crate::proxy::ProxyPool;
+use crate::route::config::RouteDef;
+use crate::route::state::{entry_tier, Tier};
+use crate::util::{now_ms, sanitize_url};
 
-/// Status codes that trigger failover to the next proxy.
-const RATE_LIMIT_CODES: &[u16] = &[421, 429, 500, 502, 503];
-/// Status codes that mean "skip this proxy for this request" without penalty.
-const SKIP_CODES: &[u16] = &[403];
+const STREAM_CHUNK_BUFFER: usize = 64;
 
-/// Response headers we strip when forwarding to the client.
-///
-/// Keeping the outgoing header block small is important: downstream nginx
-/// installations often default to a 4–8 KiB `proxy_buffer_size` and reject
-/// the response with `upstream sent too big header` otherwise. We drop:
-///  - body/framing headers that we recompute (content-length, transfer-encoding, content-encoding);
-///  - CORS — we emit our own, and duplicates blow up the header block;
-///  - Cloudflare edge chaff that the client doesn't need;
-///  - reporting / timing headers that can carry multi-KiB JSON payloads;
-///  - CSP / security hints that are meaningless for a proxied asset.
+/// Response headers we strip when forwarding to the client. Keeping the
+/// outgoing header block small matters: downstream nginx defaults to a 4–8 KiB
+/// `proxy_buffer_size` and rejects oversized header blocks.
 const SKIP_RESPONSE_HEADERS: &[&str] = &[
-    // framing
     "content-encoding",
     "content-length",
     "transfer-encoding",
-    // CORS (we set our own)
     "access-control-allow-origin",
     "access-control-allow-methods",
     "access-control-allow-headers",
     "access-control-allow-credentials",
     "access-control-expose-headers",
     "access-control-max-age",
-    // Cloudflare edge chaff
     "cf-ray",
     "cf-cache-status",
     "cf-request-id",
@@ -53,795 +40,47 @@ const SKIP_RESPONSE_HEADERS: &[&str] = &[
     "cf-bgj",
     "cf-polished",
     "cf-edge-cache",
-    // Reporting / timing (can be large JSON)
     "report-to",
     "reporting-endpoints",
     "nel",
     "expect-ct",
     "server-timing",
-    // Protocol upgrade hints (confuse HTTP/1 clients going through nginx)
     "alt-svc",
     "alternate-protocol",
-    // Security policies we don't want to propagate through the proxy
     "content-security-policy",
     "content-security-policy-report-only",
     "x-frame-options",
 ];
 
-/// Buffer size for the body streaming channel.
-const STREAM_CHUNK_BUFFER: usize = 64;
-
-/// Max bytes we buffer from a failed upstream response so we can potentially
-/// replay it to the client if every proxy fails.
-const FAILED_BODY_CAP: usize = 64 * 1024;
-
-/// A failed upstream response captured for "most common status" fallback.
-struct FailedResponse {
-    status: StatusCode,
-    content_type: Option<HeaderValue>,
-    body: Bytes,
-}
-
-/// Walk the `source()` chain of a reqwest error and join all the underlying
-/// causes into a single dense string. reqwest's top-level Display is just
-/// "error sending request for url (...)" — useless on its own; the actual
-/// reason (Connection refused / dns resolution failed / handshake failure /
-/// connection reset / etc.) lives in the chain.
-pub(crate) fn describe_reqwest_error(err: &reqwest::Error) -> String {
-    use std::error::Error;
-    let mut parts: Vec<String> = Vec::new();
-    let mut current: Option<&dyn Error> = Some(err as &dyn Error);
-    while let Some(e) = current {
-        let s = e.to_string();
-        if !parts.iter().any(|p| p == &s) {
-            parts.push(s);
-        }
-        current = e.source();
-    }
-    // The first layer is reqwest's own "error sending request for url ..."
-    // which only echoes the URL we already log; drop it if a deeper cause is
-    // available so the reason field carries the real signal.
-    if parts.len() > 1 {
-        parts.remove(0);
-    }
-    parts.join(" → ")
-}
-
-/// Check if a reqwest response is HTML (to exclude it from failure tally).
-fn is_html_response(headers: &reqwest::header::HeaderMap) -> bool {
+pub fn is_html_response(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(|ct| {
-            let lower = ct.to_ascii_lowercase();
-            lower.starts_with("text/html") || lower.starts_with("application/xhtml")
+            let l = ct.to_ascii_lowercase();
+            l.starts_with("text/html") || l.starts_with("application/xhtml")
         })
         .unwrap_or(false)
 }
 
-/// Read a failed upstream response body with a hard size cap so memory usage
-/// stays bounded even if the upstream streams garbage.
-async fn buffer_failed_response(response: reqwest::Response) -> FailedResponse {
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
-
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                let remaining = FAILED_BODY_CAP.saturating_sub(buf.len());
-                if remaining == 0 {
-                    break;
-                }
-                if bytes.len() <= remaining {
-                    buf.extend_from_slice(&bytes);
-                } else {
-                    buf.extend_from_slice(&bytes[..remaining]);
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    FailedResponse {
-        status,
-        content_type,
-        body: Bytes::from(buf),
-    }
-}
-
-/// Pick the most-frequent status among collected failures and build a response
-/// using one of the bodies that returned that status. Ties are broken by
-/// insertion order (first occurrence wins).
-fn build_most_common_response(failures: Vec<FailedResponse>) -> Option<Response> {
-    if failures.is_empty() {
-        return None;
-    }
-
-    let mut counts: HashMap<u16, usize> = HashMap::new();
-    for f in &failures {
-        *counts.entry(f.status.as_u16()).or_insert(0) += 1;
-    }
-    let best = counts.iter().max_by_key(|(_, c)| *c).map(|(s, _)| *s)?;
-    let pick = failures.into_iter().find(|f| f.status.as_u16() == best)?;
-
-    let mut builder = Response::builder().status(pick.status);
-    let hdrs = builder.headers_mut().unwrap();
-    for (name, value) in cors_headers() {
-        hdrs.insert(name, value);
-    }
-    if let Some(ct) = pick.content_type {
-        hdrs.insert("content-type", ct);
-    }
-    builder.body(Body::from(pick.body)).ok()
-}
-
-/// Hedge dispatch: GET requests that don't expect strict-JSON responses are
-/// raced across multiple upstreams. Anything else stays on the sequential
-/// failover path.
-pub async fn forward_dispatch(
-    queue: Arc<ProxyQueue>,
-    snapshot: Arc<Vec<Arc<Entry>>>,
-    method: &Method,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Response {
-    if should_hedge(method, headers) {
-        forward_hedged(queue, snapshot, method, headers, body).await
-    } else {
-        forward_with_failover(queue, snapshot, method, headers, body).await
-    }
-}
-
-/// Hedge only when the client wants HTML/media/binary; skip JSON-only API
-/// calls so we don't multiply load on idempotency-sensitive endpoints. We
-/// only hedge GET because POST/PUT/etc. can't be safely retried in parallel.
-fn should_hedge(method: &Method, headers: &HeaderMap) -> bool {
-    if *method != Method::GET {
-        return false;
-    }
-    let Some(accept) = headers.get("accept").and_then(|v| v.to_str().ok()) else {
-        return true;
-    };
-    let lower = accept.to_ascii_lowercase();
-    if !lower.contains("application/json") {
-        return true;
-    }
-    // Mixed Accept (browser-like) — still hedge.
-    if lower.contains("*/*")
-        || lower.contains("text/")
-        || lower.contains("audio/")
-        || lower.contains("video/")
-        || lower.contains("image/")
-        || lower.contains("application/octet-stream")
-    {
-        return true;
-    }
-    false
-}
-
-/// Result of a single upstream attempt during a hedged race.
-enum AttemptOutcome {
-    Success {
-        response: reqwest::Response,
-        entry: Arc<Entry>,
-        elapsed_ms: u64,
-    },
-    SoftFail {
-        response: reqwest::Response,
-        entry: Arc<Entry>,
-        elapsed_ms: u64,
-        status: u16,
-    },
-    Skip {
-        response: reqwest::Response,
-        entry: Arc<Entry>,
-        elapsed_ms: u64,
-        status: u16,
-    },
-    HardFail {
-        entry: Arc<Entry>,
-        err: String,
-        elapsed_ms: u64,
-        was_timeout: bool,
-    },
-}
-
-async fn attempt_one(
-    entry: Arc<Entry>,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
-    upstream_timeout: Duration,
-) -> AttemptOutcome {
-    debug!(
-        "→ hedge {} [{}] lat={}ms",
-        sanitize_url(&entry.url),
-        entry.tier().as_str(),
-        entry.avg_latency_ms.load(Ordering::Relaxed)
-    );
-    let start = Instant::now();
-    let result = tokio::time::timeout(
-        upstream_timeout,
-        send_to_upstream(&entry.upstream, &method, &headers, body, None),
-    )
-    .await;
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    match result {
-        Ok(Ok(response)) => {
-            let status = response.status().as_u16();
-            if RATE_LIMIT_CODES.contains(&status) {
-                AttemptOutcome::SoftFail {
-                    response,
-                    entry,
-                    elapsed_ms,
-                    status,
-                }
-            } else if SKIP_CODES.contains(&status) {
-                AttemptOutcome::Skip {
-                    response,
-                    entry,
-                    elapsed_ms,
-                    status,
-                }
-            } else {
-                AttemptOutcome::Success {
-                    response,
-                    entry,
-                    elapsed_ms,
-                }
-            }
-        }
-        Ok(Err(e)) => AttemptOutcome::HardFail {
-            entry,
-            err: describe_reqwest_error(&e),
-            elapsed_ms,
-            was_timeout: false,
-        },
-        Err(_) => AttemptOutcome::HardFail {
-            entry,
-            err: format!("timeout {}ms", upstream_timeout.as_millis()),
-            elapsed_ms,
-            was_timeout: true,
-        },
-    }
-}
-
-type AttemptFuture = Pin<Box<dyn Future<Output = AttemptOutcome> + Send>>;
-
-/// Pull the next untried entry from the snapshot and push an attempt into
-/// `futures`. Returns true if an attempt was launched.
-#[allow(clippy::too_many_arguments)]
-fn launch_attempt(
-    futures: &mut FuturesUnordered<AttemptFuture>,
-    tried: &mut HashSet<String>,
-    snapshot: &Arc<Vec<Arc<Entry>>>,
-    next_idx: &mut usize,
-    method: &Method,
-    headers: &HeaderMap,
-    body: &Bytes,
-    upstream_timeout: Duration,
-) -> bool {
-    while *next_idx < snapshot.len() {
-        let entry = snapshot[*next_idx].clone();
-        *next_idx += 1;
-        if entry.tier() == Tier::Fatal {
-            continue;
-        }
-        if !tried.insert(entry.url.clone()) {
-            continue;
-        }
-        let m = method.clone();
-        let h = headers.clone();
-        let b = body.clone();
-        futures.push(Box::pin(attempt_one(entry, m, h, b, upstream_timeout)));
-        return true;
-    }
-    false
-}
-
-/// Hedged failover: launch attempts in parallel, first non-failure response
-/// wins, others get cancelled. Bounded parallelism prevents fan-out blow-up
-/// when most upstreams are healthy.
-async fn forward_hedged(
-    queue: Arc<ProxyQueue>,
-    snapshot: Arc<Vec<Arc<Entry>>>,
-    method: &Method,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Response {
-    let upstream_timeout = queue.upstream_timeout();
-    let hedge_delay = queue.hedge_delay();
-    let max_parallel = queue.max_parallel_hedge();
-
-    let mut futures: FuturesUnordered<AttemptFuture> = FuturesUnordered::new();
-    let mut tried: HashSet<String> = HashSet::new();
-    let mut buffering: Vec<JoinHandle<FailedResponse>> = Vec::new();
-    let mut last_error: Option<String> = None;
-    let mut next_idx: usize = 0;
-
-    let _ = launch_attempt(
-        &mut futures,
-        &mut tried,
-        &snapshot,
-        &mut next_idx,
-        method,
-        headers,
-        &body,
-        upstream_timeout,
-    );
-
-    let timer = tokio::time::sleep(hedge_delay);
-    tokio::pin!(timer);
-
-    while !futures.is_empty() {
-        tokio::select! {
-            biased;
-            Some(outcome) = futures.next() => {
-                match outcome {
-                    AttemptOutcome::Success { response, entry, elapsed_ms } => {
-                        debug!(
-                            "hedge winner {} success {} in {}ms",
-                            sanitize_url(&entry.url),
-                            response.status().as_u16(),
-                            elapsed_ms
-                        );
-                        queue.record_success(&entry, elapsed_ms);
-                        let used_index = snapshot
-                            .iter()
-                            .position(|e| Arc::ptr_eq(e, &entry))
-                            .unwrap_or(0);
-                        // Cancel buffering tasks — we don't need their bodies.
-                        for h in &buffering {
-                            h.abort();
-                        }
-                        let can_recover =
-                            *method == Method::GET && can_recover_stream(headers, &response);
-                        // Dropping `futures` here cancels every other in-flight
-                        // attempt; reqwest aborts the underlying connections.
-                        drop(futures);
-                        return build_streaming_response(
-                            response,
-                            queue.clone(),
-                            snapshot.clone(),
-                            used_index,
-                            method,
-                            headers,
-                            &body,
-                            can_recover,
-                            tried,
-                        )
-                        .await;
-                    }
-                    AttemptOutcome::SoftFail { response, entry, elapsed_ms, status } => {
-                        debug!(
-                            "hedge {} replied {} in {}ms (soft-fail)",
-                            sanitize_url(&entry.url),
-                            status,
-                            elapsed_ms
-                        );
-                        queue.record_soft_error(
-                            &entry,
-                            elapsed_ms,
-                            &format!("status {status}"),
-                        );
-                        last_error = Some(format!("status {status}"));
-                        if !is_html_response(response.headers()) {
-                            buffering.push(tokio::spawn(buffer_failed_response(response)));
-                        }
-                        launch_attempt(
-                            &mut futures,
-                            &mut tried,
-                            &snapshot,
-                            &mut next_idx,
-                            method,
-                            headers,
-                            &body,
-                            upstream_timeout,
-                        );
-                    }
-                    AttemptOutcome::Skip { response, entry, elapsed_ms, status } => {
-                        debug!(
-                            "hedge {} skip code {} in {}ms",
-                            sanitize_url(&entry.url),
-                            status,
-                            elapsed_ms
-                        );
-                        last_error = Some(format!("skipped {status}"));
-                        if !is_html_response(response.headers()) {
-                            buffering.push(tokio::spawn(buffer_failed_response(response)));
-                        }
-                        launch_attempt(
-                            &mut futures,
-                            &mut tried,
-                            &snapshot,
-                            &mut next_idx,
-                            method,
-                            headers,
-                            &body,
-                            upstream_timeout,
-                        );
-                    }
-                    AttemptOutcome::HardFail { entry, err, elapsed_ms, was_timeout } => {
-                        if was_timeout {
-                            warn!(
-                                "upstream {} timed out after {}ms",
-                                sanitize_url(&entry.url),
-                                elapsed_ms
-                            );
-                        } else {
-                            warn!(
-                                "upstream {} connection error in {}ms: {}",
-                                sanitize_url(&entry.url),
-                                elapsed_ms,
-                                err
-                            );
-                        }
-                        queue.record_hard_error(&entry, &err);
-                        last_error = Some(err);
-                        launch_attempt(
-                            &mut futures,
-                            &mut tried,
-                            &snapshot,
-                            &mut next_idx,
-                            method,
-                            headers,
-                            &body,
-                            upstream_timeout,
-                        );
-                    }
-                }
-            }
-            _ = &mut timer => {
-                timer.as_mut().reset(tokio::time::Instant::now() + hedge_delay);
-                if futures.len() < max_parallel {
-                    launch_attempt(
-                        &mut futures,
-                        &mut tried,
-                        &snapshot,
-                        &mut next_idx,
-                        method,
-                        headers,
-                        &body,
-                        upstream_timeout,
-                    );
-                }
-            }
-        }
-    }
-
-    // Exhausted: collect whatever bodies finished buffering for the
-    // most-common-status fallback.
-    let mut failures: Vec<FailedResponse> = Vec::new();
-    for handle in buffering {
-        if let Ok(fr) = handle.await {
-            failures.push(fr);
-        }
-    }
-
-    if let Some(resp) = try_fatal_proxies(
-        &queue,
-        &snapshot,
-        method,
-        headers,
-        &body,
-        &tried,
-        &mut failures,
-        &mut last_error,
-    )
-    .await
-    {
-        return resp;
-    }
-
-    queue.mark_all_failed();
-    let msg = last_error.unwrap_or_else(|| "all upstream proxies exhausted".to_string());
-    error!("All upstream proxies failed (hedged): {}", msg);
-    if let Some(resp) = build_most_common_response(failures) {
-        return resp;
-    }
-    proxy_common::response::text_response(
-        StatusCode::BAD_GATEWAY,
-        &format!("Proxy Error: {msg}"),
-    )
-}
-
-/// Forward a request through the proxy queue with failover and mid-stream
-/// recovery.
-pub async fn forward_with_failover(
-    queue: Arc<ProxyQueue>,
-    snapshot: Arc<Vec<Arc<Entry>>>,
-    method: &Method,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Response {
-    let upstream_timeout = queue.upstream_timeout();
-    let mut last_error: Option<String> = None;
-    let mut tried: HashSet<String> = HashSet::new();
-    let mut failures: Vec<FailedResponse> = Vec::new();
-
-    for (index, entry) in snapshot.iter().enumerate() {
-        if entry.tier() == Tier::Fatal {
-            continue;
-        }
-        tried.insert(entry.url.clone());
-        debug!(
-            "→ upstream {} [{}] lat={}ms",
-            sanitize_url(&entry.url),
-            entry.tier().as_str(),
-            entry.avg_latency_ms.load(std::sync::atomic::Ordering::Relaxed)
-        );
-
-        let start = Instant::now();
-        let result = tokio::time::timeout(
-            upstream_timeout,
-            send_to_upstream(&entry.upstream, method, headers, body.clone(), None),
-        )
-        .await;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        match result {
-            Ok(Ok(response)) => {
-                let status_code = response.status().as_u16();
-
-                if RATE_LIMIT_CODES.contains(&status_code) {
-                    debug!(
-                        "upstream {} replied {} in {}ms (soft-fail)",
-                        sanitize_url(&entry.url),
-                        status_code,
-                        elapsed_ms
-                    );
-                    queue.record_soft_error(
-                        entry,
-                        elapsed_ms,
-                        &format!("status {status_code}"),
-                    );
-                    last_error = Some(format!("status {status_code}"));
-                    if !is_html_response(response.headers()) {
-                        failures.push(buffer_failed_response(response).await);
-                    }
-                    continue;
-                }
-
-                if SKIP_CODES.contains(&status_code) {
-                    debug!(
-                        "upstream {} returned skip code {} ({}ms)",
-                        sanitize_url(&entry.url),
-                        status_code,
-                        elapsed_ms
-                    );
-                    last_error = Some(format!("skipped {status_code}"));
-                    if !is_html_response(response.headers()) {
-                        failures.push(buffer_failed_response(response).await);
-                    }
-                    continue;
-                }
-
-                debug!(
-                    "upstream {} success {} in {}ms",
-                    sanitize_url(&entry.url),
-                    status_code,
-                    elapsed_ms
-                );
-                queue.record_success(entry, elapsed_ms);
-
-                let can_recover =
-                    *method == Method::GET && can_recover_stream(headers, &response);
-
-                return build_streaming_response(
-                    response,
-                    queue.clone(),
-                    snapshot.clone(),
-                    index,
-                    method,
-                    headers,
-                    &body,
-                    can_recover,
-                    tried,
-                )
-                .await;
-            }
-            Ok(Err(e)) => {
-                let reason = describe_reqwest_error(&e);
-                warn!(
-                    "upstream {} connection error in {}ms: {}",
-                    sanitize_url(&entry.url),
-                    elapsed_ms,
-                    reason
-                );
-                queue.record_hard_error(entry, &reason);
-                last_error = Some(reason);
-            }
-            Err(_) => {
-                warn!(
-                    "upstream {} timed out after {}ms",
-                    sanitize_url(&entry.url),
-                    upstream_timeout.as_millis()
-                );
-                queue.record_hard_error(
-                    entry,
-                    &format!("timeout {}ms", upstream_timeout.as_millis()),
-                );
-                last_error = Some(format!(
-                    "timeout after {}ms",
-                    upstream_timeout.as_millis()
-                ));
-            }
-        }
-    }
-
-    if let Some(resp) = try_fatal_proxies(
-        &queue,
-        &snapshot,
-        method,
-        headers,
-        &body,
-        &tried,
-        &mut failures,
-        &mut last_error,
-    )
-    .await
-    {
-        return resp;
-    }
-
-    queue.mark_all_failed();
-    let msg = last_error.unwrap_or_else(|| "all upstream proxies exhausted".to_string());
-    error!("All upstream proxies failed: {}", msg);
-
-    if let Some(resp) = build_most_common_response(failures) {
-        return resp;
-    }
-
-    proxy_common::response::text_response(
-        StatusCode::BAD_GATEWAY,
-        &format!("Proxy Error: {msg}"),
-    )
-}
-
-/// Last-resort attempt over entries currently marked fatal that weren't
-/// tried this request. Does NOT touch queue/entry state — fatal proxies
-/// stay fatal regardless of outcome on this request, and recovery is
-/// disabled so the streaming task is also mutation-free.
-#[allow(clippy::too_many_arguments)]
-async fn try_fatal_proxies(
-    queue: &Arc<ProxyQueue>,
-    snapshot: &Arc<Vec<Arc<Entry>>>,
-    method: &Method,
-    headers: &HeaderMap,
-    body: &Bytes,
-    tried: &HashSet<String>,
-    failures: &mut Vec<FailedResponse>,
-    last_error: &mut Option<String>,
-) -> Option<Response> {
-    let upstream_timeout = queue.upstream_timeout();
-    for (index, entry) in snapshot.iter().enumerate() {
-        if entry.tier() != Tier::Fatal {
-            continue;
-        }
-        if tried.contains(&entry.url) {
-            continue;
-        }
-        warn!(
-            "fatal fallback: trying {} (no live proxies left)",
-            sanitize_url(&entry.url)
-        );
-
-        let start = Instant::now();
-        let result = tokio::time::timeout(
-            upstream_timeout,
-            send_to_upstream(&entry.upstream, method, headers, body.clone(), None),
-        )
-        .await;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        match result {
-            Ok(Ok(response)) => {
-                let status_code = response.status().as_u16();
-
-                if RATE_LIMIT_CODES.contains(&status_code) {
-                    *last_error = Some(format!("status {status_code}"));
-                    if !is_html_response(response.headers()) {
-                        failures.push(buffer_failed_response(response).await);
-                    }
-                    continue;
-                }
-
-                if SKIP_CODES.contains(&status_code) {
-                    *last_error = Some(format!("skipped {status_code}"));
-                    if !is_html_response(response.headers()) {
-                        failures.push(buffer_failed_response(response).await);
-                    }
-                    continue;
-                }
-
-                warn!(
-                    "fatal fallback: {} returned {} in {}ms",
-                    sanitize_url(&entry.url),
-                    status_code,
-                    elapsed_ms
-                );
-
-                return Some(
-                    build_streaming_response(
-                        response,
-                        queue.clone(),
-                        snapshot.clone(),
-                        index,
-                        method,
-                        headers,
-                        body,
-                        false,
-                        tried.clone(),
-                    )
-                    .await,
-                );
-            }
-            Ok(Err(e)) => {
-                let reason = describe_reqwest_error(&e);
-                debug!(
-                    "fatal fallback: {} still failing in {}ms: {}",
-                    sanitize_url(&entry.url),
-                    elapsed_ms,
-                    reason
-                );
-                *last_error = Some(reason);
-            }
-            Err(_) => {
-                debug!(
-                    "fatal fallback: {} timed out after {}ms",
-                    sanitize_url(&entry.url),
-                    upstream_timeout.as_millis()
-                );
-                *last_error = Some(format!("timeout after {}ms", upstream_timeout.as_millis()));
-            }
-        }
-    }
-    None
-}
-
-/// Check if the stream can be resumed against another proxy on mid-stream
-/// failure (needs a cacheable / media GET).
-fn can_recover_stream(req_headers: &HeaderMap, response: &reqwest::Response) -> bool {
+/// Whether a broken stream can be resumed against another proxy (cacheable /
+/// media GET). The proxy decides this itself — it isn't Lua-configurable, the
+/// streaming layer already knows what's safe to resume with a `Range`.
+pub fn can_recover_stream(req_headers: &HeaderMap, response: &reqwest::Response) -> bool {
     let has_cache_headers = req_headers.contains_key("cache-control")
         || req_headers.contains_key("pragma")
         || req_headers.contains_key("if-none-match")
         || req_headers.contains_key("if-modified-since");
-
     let content_type = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-
     let is_media = content_type.starts_with("audio/") || content_type.starts_with("video/");
-
     has_cache_headers || is_media
 }
 
-/// Pipe the upstream body to the client, with optional failover recovery on
-/// stream error.
-#[allow(clippy::too_many_arguments)]
-async fn build_streaming_response(
-    response: reqwest::Response,
-    queue: Arc<ProxyQueue>,
-    snapshot: Arc<Vec<Arc<Entry>>>,
-    used_index: usize,
-    method: &Method,
-    original_headers: &HeaderMap,
-    original_body: &Bytes,
-    can_recover: bool,
-    mut tried: HashSet<String>,
-) -> Response {
-    let status = response.status();
-    let resp_headers = response.headers().clone();
-
+fn copy_headers(status: StatusCode, resp_headers: &reqwest::header::HeaderMap) -> http::response::Builder {
     let mut builder = Response::builder().status(status);
     let hdrs = builder.headers_mut().unwrap();
     for (name, value) in cors_headers() {
@@ -852,26 +91,57 @@ async fn build_streaming_response(
             hdrs.append(name.clone(), value.clone());
         }
     }
+    builder
+}
+
+/// Build a non-streaming response from a fully buffered body (used when a
+/// route enabled `capture_body_bytes`, so we already read the whole body).
+pub fn buffered_response(
+    status: StatusCode,
+    resp_headers: &reqwest::header::HeaderMap,
+    body: Bytes,
+) -> Response {
+    copy_headers(status, resp_headers)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Pipe the upstream body to the client, resuming against another proxy on
+/// mid-stream failure when `can_recover`.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_streaming_response(
+    response: reqwest::Response,
+    pool: Arc<ProxyPool>,
+    route: Arc<RouteDef>,
+    used_url: String,
+    method: &Method,
+    original_headers: &HeaderMap,
+    original_body: &Bytes,
+    can_recover: bool,
+    mut tried: HashSet<String>,
+) -> Response {
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+    let builder = copy_headers(status, &resp_headers);
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHUNK_BUFFER);
 
     let method = method.clone();
     let original_headers = original_headers.clone();
     let original_body = original_body.clone();
-    let upstream_timeout = queue.upstream_timeout();
+    let timeout = Duration::from_millis(route.timeout_ms);
 
     tokio::spawn(async move {
         let mut stream: BoxStream<'static, Result<Bytes, reqwest::Error>> =
             Box::pin(response.bytes_stream());
         let mut total_bytes: u64 = 0;
-        let mut current_url = snapshot[used_index].url.clone();
+        let mut current_url = used_url;
 
         loop {
             match stream.next().await {
                 Some(Ok(chunk)) => {
                     total_bytes += chunk.len() as u64;
                     if tx.send(Ok(chunk)).await.is_err() {
-                        // Client disconnected; drop the upstream stream implicitly.
                         return;
                     }
                 }
@@ -883,108 +153,82 @@ async fn build_streaming_response(
                         total_bytes,
                         reason
                     );
-
                     if !can_recover {
                         let _ = tx.send(Err(std::io::Error::other(reason))).await;
                         return;
                     }
+                    if let Some(e) = pool.find(&current_url) {
+                        e.route_state(route.id).observe_failure(
+                            None,
+                            &format!("stream error: {reason}"),
+                            route.slow_ms,
+                        );
+                    }
 
-                    queue.record_hard_error_url(
-                        &current_url,
-                        &format!("stream error: {reason}"),
-                    );
-
-                    info!(
-                        "stream recovery: resuming at byte {} (excluding tried={})",
-                        total_bytes,
-                        tried.len()
-                    );
-
-                    // Use the live (possibly reordered) snapshot for recovery so
-                    // we target proxies in up-to-date priority order.
-                    let live = queue.snapshot();
+                    let live = pool.snapshot();
+                    let now = now_ms();
                     let mut recovered = false;
 
                     for next in live.iter() {
-                        if next.tier() == Tier::Fatal {
+                        let st = next.route_state(route.id);
+                        if entry_tier(next, &st, &route, now) >= Tier::Banned {
                             continue;
                         }
                         if !tried.insert(next.url.clone()) {
                             continue;
                         }
-
-                        info!(
-                            "recovery: trying {} [{}]",
-                            sanitize_url(&next.url),
-                            next.tier().as_str()
-                        );
-
-                        let mut extra_headers = HeaderMap::new();
-                        if let Ok(range_val) =
-                            HeaderValue::from_str(&format!("bytes={total_bytes}-"))
-                        {
-                            extra_headers.insert("range", range_val);
+                        let mut extra = HeaderMap::new();
+                        if let Ok(rv) = HeaderValue::from_str(&format!("bytes={total_bytes}-")) {
+                            extra.insert("range", rv);
                         }
-
-                        let mut recovery_headers = original_headers.clone();
-                        recovery_headers.remove("if-none-match");
-                        recovery_headers.remove("if-modified-since");
+                        let mut rh = original_headers.clone();
+                        rh.remove("if-none-match");
+                        rh.remove("if-modified-since");
 
                         let start = Instant::now();
                         let result = tokio::time::timeout(
-                            upstream_timeout,
+                            timeout,
                             send_to_upstream(
                                 &next.upstream,
                                 &method,
-                                &recovery_headers,
+                                &rh,
                                 original_body.clone(),
-                                Some(&extra_headers),
+                                Some(&extra),
                             ),
                         )
                         .await;
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let elapsed = start.elapsed().as_millis() as u64;
 
                         match result {
-                            Ok(Ok(recovery_resp)) => {
-                                let recovery_status = recovery_resp.status().as_u16();
-                                if recovery_status == 206 || recovery_status == 200 {
+                            Ok(Ok(rr)) => {
+                                let rs = rr.status().as_u16();
+                                if rs == 206 || rs == 200 {
                                     info!(
-                                        "recovery established via {} ({}) in {}ms",
+                                        "stream recovery via {} ({}) in {}ms",
                                         sanitize_url(&next.url),
-                                        recovery_status,
-                                        elapsed_ms
+                                        rs,
+                                        elapsed
                                     );
-                                    queue.record_success(next, elapsed_ms);
-
-                                    let mut new_stream: BoxStream<
+                                    st.observe_success(elapsed);
+                                    next.global.success_count.fetch_add(1, Ordering::Relaxed);
+                                    let mut ns: BoxStream<
                                         'static,
                                         Result<Bytes, reqwest::Error>,
-                                    > = Box::pin(recovery_resp.bytes_stream());
-
-                                    // Server returned 200 OK (ignored Range): discard
-                                    // the bytes already sent.
-                                    if recovery_status == 200 && total_bytes > 0 {
-                                        warn!(
-                                            "range ignored by {} — skipping {} bytes",
-                                            sanitize_url(&next.url),
-                                            total_bytes
-                                        );
+                                    > = Box::pin(rr.bytes_stream());
+                                    if rs == 200 && total_bytes > 0 {
                                         let mut skipped: u64 = 0;
                                         while skipped < total_bytes {
-                                            match new_stream.next().await {
-                                                Some(Ok(chunk)) => {
-                                                    let remaining = total_bytes - skipped;
-                                                    let chunk_len = chunk.len() as u64;
-                                                    if chunk_len <= remaining {
-                                                        skipped += chunk_len;
+                                            match ns.next().await {
+                                                Some(Ok(c)) => {
+                                                    let rem = total_bytes - skipped;
+                                                    let cl = c.len() as u64;
+                                                    if cl <= rem {
+                                                        skipped += cl;
                                                     } else {
-                                                        let keep =
-                                                            &chunk[remaining as usize..];
+                                                        let keep = &c[rem as usize..];
                                                         total_bytes += keep.len() as u64;
                                                         if tx
-                                                            .send(Ok(Bytes::copy_from_slice(
-                                                                keep,
-                                                            )))
+                                                            .send(Ok(Bytes::copy_from_slice(keep)))
                                                             .await
                                                             .is_err()
                                                         {
@@ -997,59 +241,40 @@ async fn build_streaming_response(
                                             }
                                         }
                                     }
-
-                                    stream = new_stream;
+                                    stream = ns;
                                     current_url = next.url.clone();
                                     recovered = true;
                                     break;
-                                } else if RATE_LIMIT_CODES.contains(&recovery_status) {
-                                    warn!(
-                                        "recovery: {} replied {} in {}ms (soft-fail)",
-                                        sanitize_url(&next.url),
-                                        recovery_status,
-                                        elapsed_ms
-                                    );
-                                    queue.record_soft_error(
-                                        next,
-                                        elapsed_ms,
-                                        &format!("recovery status {recovery_status}"),
-                                    );
                                 } else {
-                                    warn!(
-                                        "recovery: {} returned {} in {}ms",
-                                        sanitize_url(&next.url),
-                                        recovery_status,
-                                        elapsed_ms
-                                    );
-                                    queue.record_hard_error(
-                                        next,
-                                        &format!("recovery status {recovery_status}"),
+                                    st.observe_failure(
+                                        Some(elapsed),
+                                        &format!("recovery status {rs}"),
+                                        route.slow_ms,
                                     );
                                 }
                             }
                             Ok(Err(re)) => {
-                                let reason = describe_reqwest_error(&re);
+                                let r = describe_reqwest_error(&re);
                                 warn!(
-                                    "recovery: {} connection failed in {}ms: {}",
+                                    "recovery {} failed in {}ms: {}",
                                     sanitize_url(&next.url),
-                                    elapsed_ms,
-                                    reason
+                                    elapsed,
+                                    r
                                 );
-                                queue.record_hard_error(next, &format!("recovery: {reason}"));
+                                st.observe_failure(
+                                    None,
+                                    &format!("recovery: {r}"),
+                                    route.slow_ms,
+                                );
                             }
                             Err(_) => {
-                                warn!(
-                                    "recovery: {} timed out after {}ms",
-                                    sanitize_url(&next.url),
-                                    upstream_timeout.as_millis()
-                                );
-                                queue.record_hard_error(next, "recovery timeout");
+                                st.observe_failure(None, "recovery timeout", route.slow_ms);
                             }
                         }
                     }
 
                     if !recovered {
-                        error!("all recovery attempts failed; closing stream");
+                        error!("all stream recovery attempts failed; closing");
                         return;
                     }
                 }
@@ -1059,68 +284,5 @@ async fn build_streaming_response(
     });
 
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = Body::from_stream(body_stream);
-
-    builder.body(body).unwrap()
-}
-
-/// Dispatch a single upstream request based on the upstream kind.
-pub(crate) async fn send_to_upstream(
-    upstream: &Upstream,
-    method: &Method,
-    headers: &HeaderMap,
-    body: Bytes,
-    extra_headers: Option<&HeaderMap>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    use crate::upstream::UpstreamKind;
-
-    match &upstream.kind {
-        UpstreamKind::Endpoint { url, client } => {
-            crate::upstream::endpoint::forward(
-                client,
-                url,
-                method,
-                headers,
-                body,
-                extra_headers,
-            )
-            .await
-        }
-        UpstreamKind::HttpProxy { client } => {
-            let target_url = proxy_common::target::decode_target(
-                headers
-                    .get("x-target")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or(""),
-            )
-            .unwrap_or_default();
-            crate::upstream::http_proxy::forward(
-                client,
-                &target_url,
-                method,
-                headers,
-                body,
-                extra_headers,
-            )
-            .await
-        }
-        UpstreamKind::Socks5 { client } => {
-            let target_url = proxy_common::target::decode_target(
-                headers
-                    .get("x-target")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or(""),
-            )
-            .unwrap_or_default();
-            crate::upstream::socks::forward(
-                client,
-                &target_url,
-                method,
-                headers,
-                body,
-                extra_headers,
-            )
-            .await
-        }
-    }
+    builder.body(Body::from_stream(body_stream)).unwrap()
 }

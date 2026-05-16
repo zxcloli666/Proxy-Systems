@@ -42,33 +42,68 @@ For subnet rotation to work:
 
 ### intermediate-proxy
 
-Smart router with automatic failover, latency-aware tier ordering, and lock-free hot path.
+Lua-programmable router with a **per-route × per-proxy** health matrix. A proxy
+banned on `api-v2.soundcloud.com` is still used for `genius.com`; bans, probes,
+timeouts and the selector are all decided per route by an embedded Lua config.
 
-- **Tiered priority queue** — each upstream is classified as `healthy` / `slow` / `failed` from runtime stats (EWMA latency, consecutive failures). Ordering is `(regular ⟶ reserve) × (healthy ⟶ slow ⟶ failed)`, so bad proxies drift to a "not recommended" zone and reserves always stay at the end.
-- **Lock-free snapshots** — reads use `ArcSwap`; stats are plain atomics. A background task re-sorts the queue when a tier transition is detected (debounced by `RESORT_INTERVAL_MS`).
-- **Outcome classification** — `421/429/500/502/503` → soft-fail (penalized latency), `403` → skip without penalty (target block), network error / timeout → hard-fail.
-- **Stream recovery** — on mid-stream failure for GET requests with cache/media headers, resumes from the next un-tried proxy (using the live snapshot) via `Range` header.
-- **HTTP/1 only** — required for Cloudflare `workers.dev` upstreams.
-- **Upstream types** determined by URL scheme:
-  - `http://` / `https://` — endpoint (forward with `X-Target` header)
-  - `socks5://host:port` — SOCKS5 proxy (request goes directly to target)
-  - `forward://host:port` — HTTP forward proxy
+- **Per-route health** — every `(route, proxy)` pair tracks its own tier
+  (`healthy`/`slow`/`failed`/`banned`/`fatal`), EWMA latency and ban expiry. A
+  transport-level connect failure marks the proxy fatal globally (it's
+  unreachable everywhere); everything else is a per-route ban.
+- **Lua classification** — `on_response(ctx, res)` returns a verdict:
+  `success`, `return_as_is` (target's fault — proxy fine), `retry_other_proxy`
+  (ban this proxy on this route for `ban_for_ms`, try the next),
+  `retry_same_proxy`, `hard_fail`, or `give_up`. Lua errors fail open to
+  `success`. CPU-only, run on a pool of sandboxed VMs with an instruction
+  budget.
+- **Route matching** — first route whose `host`/`host_regex` + `path`/`path_regex`
+  + `methods` match, then an optional Lua `predicate(req)`. No match → `502`.
+- **Selectors (per route)** — `best_latency`, `round_robin`, `random`,
+  `sticky_by_header`, or `hedge` (parallel race; `max_parallel`/`delay_ms` set
+  in Lua, never auto).
+- **Per-route probes** — each route declares its own `probe { url,
+  interval_ms, ok_statuses, classify }`. Banned proxies are re-probed on that
+  schedule (bounded by `MAX_CONCURRENT_PROBES`) and unbanned on success.
+- **`on_exhausted(ctx)`** — when every live proxy failed: `try_fatal`
+  (last-resort over banned/fatal), `wait_probe`, `retry_all`, or
+  `return_error`. A global `MAX_HARD_ATTEMPTS` cap stops Lua retry loops.
+- **Hot reload, no restart** — `proxies.txt` and `routes.lua` are polled by
+  mtime. The proxy list diffs by URL so live proxies keep their stats; a
+  broken `routes.lua` is logged and the previous config keeps serving (never
+  half-applied).
+- **Proxy tags** — `socks5://h:1080 tags=anon,us`; a route picks a pool with
+  `pool = { tags = {"anon"} }`. The `reserve` tag means "only when every
+  non-reserve proxy for the route is down".
+- **Stream recovery** — mid-stream failures on cacheable/media GETs resume
+  from the next proxy via `Range` (proxy-managed, not Lua-configurable).
+- **Upstream types** by URL scheme: `http(s)://` endpoint (`X-Target` header),
+  `socks5://` SOCKS5, `forward://` HTTP forward proxy. HTTP/1 only.
+
+Wire API is unchanged: clients still send the base64 target in `X-Target`.
 
 **Port:** `3000` (env `PORT`)
 
 | Env | Description | Default |
 |-----|-------------|---------|
-| `PROXY_URL` | Comma-separated list of upstream proxies | `http://localhost:8080` |
-| `RESERVE_PROXY_URL` | Comma-separated list of reserve proxies | — |
-| `SLOW_THRESHOLD_MS` | EWMA latency above this demotes a proxy to the `slow` tier | `3000` |
-| `UPSTREAM_TIMEOUT_MS` | Per-attempt time-to-first-byte timeout | `10000` |
-| `RESORT_INTERVAL_MS` | Max delay between queue re-sorts when stats change | `2000` |
-| `FATAL_PROBE_URL` | URL the prober hits to recover regular proxies stuck in the `fatal` tier (set empty to disable) | `https://www.google.com/generate_204` |
-| `FATAL_PROBE_INTERVAL_MS` | How often the prober tests fatal regular proxies (set `0` to disable) | `10000` |
+| `PROXY_FILE` | Path to the proxy list (hot-reloaded) | `/etc/proxies.txt` |
+| `PROXY_REFRESH_MS` | Proxy file mtime poll interval | `30000` |
+| `ROUTES_FILE` | Path to the Lua routing config (hot-reloaded) | `/etc/routes.lua` |
+| `ROUTES_REFRESH_MS` | Routes file mtime poll interval | `30000` |
+| `MAX_CONCURRENT_PROBES` | Global cap on in-flight probe requests | `16` |
+| `LUA_VM_COUNT` | Number of pooled Lua VMs | `cpus×2` (min 4) |
+| `LUA_INSTRUCTION_LIMIT` | Per-call Lua instruction budget (0 = off) | `1000000` |
+| `MAX_HARD_ATTEMPTS` | Hard cap on `retry_all`/`wait_probe` rounds | `20` |
 
-A regular proxy that fails with a connect-class hard error (`client error (Connect) → ...` or `timeout`) is moved to the `fatal` tier and excluded from dispatch. The background prober periodically issues a request through it to `FATAL_PROBE_URL`; any HTTP response (regardless of status) restores it. Reserve proxies are never marked fatal.
+`routes.lua` missing or unparseable at startup is fatal (the proxy can't route
+without it). `proxies.txt` missing starts empty and warns — the watcher picks
+it up when it appears. See `intermediate-proxy/examples/` for a commented
+`proxies.txt` and a production-shaped `routes.lua` (SoundCloud v1/v2, Genius
+token vs scrape, lyrics sites, catch-all).
 
-`GET /health` returns per-proxy tier (including `fatal` with `fatalSinceMs` / `fatalCount`), average / last latency, success/error counts, consecutive failures, last error reason, plus tier totals and prober config under `fatalProbe`.
+**Health endpoints:**
+- `GET /health` — proxy totals + per-route tier counts + probe config.
+- `GET /health/route/{name}` — every proxy's state for one route.
+- `GET /health/proxy?url=<proxy-url>` — one proxy across all routes it has seen.
 
 #### Built-in TLS (Let's Encrypt)
 

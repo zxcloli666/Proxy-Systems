@@ -11,7 +11,8 @@
 # scope, so the builder layer is built once across the run.
 
 FROM rust:1-alpine AS builder
-RUN apk add --no-cache musl-dev cmake make perl
+# gcc: mlua `vendored` compiles Lua 5.4 C sources via the cc crate.
+RUN apk add --no-cache musl-dev cmake make perl gcc
 WORKDIR /build
 
 # === Layer 1: dependency cache ===
