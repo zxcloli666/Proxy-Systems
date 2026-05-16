@@ -10,6 +10,9 @@
 --   prefer_tags   {..} — proxies with any of these tags float to the front of
 --                 the plan (health-aware: a banned preferred proxy is skipped).
 --                 Settable in `defaults`; override per route with `{}`.
+--   exclude_tags  {..} — proxies with any of these tags are never eligible for
+--                 this route (also excluded from the fatal fallback). Settable
+--                 in `defaults`; override per route with `{}`.
 --   selector      "best_latency" | "round_robin" | "random"
 --                 | "sticky_by_header" (+ sticky_header) | "hedge"
 --   hedge         { max_parallel = N, delay_ms = N }   (selector="hedge")
