@@ -62,6 +62,14 @@ fn tag_match(entry: &Entry, all: &[String], any: &[String]) -> bool {
     true
 }
 
+fn is_excluded(entry: &Entry, exclude: &[String]) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    let tags = entry.tags();
+    exclude.iter().any(|x| tags.iter().any(|t| t == x))
+}
+
 pub struct Candidate {
     pub entry: Arc<Entry>,
     pub tier: Tier,
@@ -83,6 +91,9 @@ pub fn build_plan(
     let mut live: Vec<Candidate> = Vec::with_capacity(snapshot.len().min(64));
 
     for e in snapshot.iter() {
+        if is_excluded(e, &route.exclude_tags) {
+            continue;
+        }
         if !tag_match(e, pool_all, pool_any) {
             continue;
         }
@@ -134,6 +145,9 @@ pub fn fallback_pool(
     let mut out: Vec<(u64, Arc<Entry>)> = Vec::new();
     for e in snapshot.iter() {
         if tried.contains(&e.url) {
+            continue;
+        }
+        if is_excluded(e, &route.exclude_tags) {
             continue;
         }
         if !tag_match(e, pool_all, pool_any) {
