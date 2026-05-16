@@ -72,8 +72,10 @@ timeouts and the selector are all decided per route by an embedded Lua config.
   broken `routes.lua` is logged and the previous config keeps serving (never
   half-applied).
 - **Proxy tags** — `socks5://h:1080 tags=anon,us`; a route picks a pool with
-  `pool = { tags = {"anon"} }`. The `reserve` tag means "only when every
-  non-reserve proxy for the route is down".
+  `pool = { tags = {"anon"} }`. `prefer_tags = {"ipv6"}` floats tagged proxies
+  to the front of the attempt plan (health-aware — a banned preferred proxy is
+  skipped, not forced); set it in `defaults` and override per route with `{}`.
+  The `reserve` tag means "only when every non-reserve proxy is down".
 - **Stream recovery** — mid-stream failures on cacheable/media GETs resume
   from the next proxy via `Range` (proxy-managed, not Lua-configurable).
 - **Upstream types** by URL scheme: `http(s)://` endpoint (`X-Target` header),

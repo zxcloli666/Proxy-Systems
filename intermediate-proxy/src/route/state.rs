@@ -105,6 +105,17 @@ pub fn build_plan(
         live.sort_by_key(|c| c.entry.is_reserve());
     }
 
+    // Applied last so it dominates: any proxy carrying a preferred tag floats
+    // to the very front, preserving the selector order within each group.
+    // Banned/fatal preferred proxies were already filtered out above, so this
+    // never forces a dead proxy.
+    if !route.prefer_tags.is_empty() {
+        live.sort_by_key(|c| {
+            let tags = c.entry.tags();
+            !route.prefer_tags.iter().any(|p| tags.iter().any(|t| t == p))
+        });
+    }
+
     live.truncate(route.max_attempts);
     live
 }

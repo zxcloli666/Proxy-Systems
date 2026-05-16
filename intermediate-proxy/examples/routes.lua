@@ -7,6 +7,9 @@
 --   name          string
 --   match         { host | host_regex, path | path_regex, methods, predicate }
 --   pool          { tags = {..all required..}, any_tags = {..at least one..} }
+--   prefer_tags   {..} — proxies with any of these tags float to the front of
+--                 the plan (health-aware: a banned preferred proxy is skipped).
+--                 Settable in `defaults`; override per route with `{}`.
 --   selector      "best_latency" | "round_robin" | "random"
 --                 | "sticky_by_header" (+ sticky_header) | "hedge"
 --   hedge         { max_parallel = N, delay_ms = N }   (selector="hedge")

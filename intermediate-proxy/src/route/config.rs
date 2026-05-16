@@ -64,6 +64,10 @@ pub struct RouteDef {
     pub matcher: Matcher,
     pub pool_all_tags: Vec<String>,
     pub pool_any_tags: Vec<String>,
+    /// Proxies carrying any of these tags are floated to the front of the
+    /// attempt plan (still health-filtered: a banned preferred proxy is
+    /// skipped, not forced).
+    pub prefer_tags: Vec<String>,
     pub selector: Selector,
     pub hedge: HedgeCfg,
     pub max_attempts: usize,
@@ -103,6 +107,7 @@ struct Defaults {
     attempt_backoff_ms: u64,
     capture_body_bytes: usize,
     prefer_non_reserve: bool,
+    prefer_tags: Vec<String>,
     default_ban_ms: u64,
     selector: Selector,
     hedge: HedgeCfg,
@@ -244,6 +249,7 @@ fn parse_defaults(cfg: &Table) -> Defaults {
                 attempt_backoff_ms: 0,
                 capture_body_bytes: 0,
                 prefer_non_reserve: true,
+                prefer_tags: Vec::new(),
                 default_ban_ms: 5 * 60_000,
                 selector: Selector::BestLatency,
                 hedge: HedgeCfg {
@@ -265,6 +271,7 @@ fn parse_defaults(cfg: &Table) -> Defaults {
         attempt_backoff_ms: get_u64(&d, "attempt_backoff_ms", 0),
         capture_body_bytes: get_usize(&d, "capture_body_bytes", 0),
         prefer_non_reserve: get_bool(&d, "prefer_non_reserve", true),
+        prefer_tags: get_string_list(&d, "prefer_tags"),
         default_ban_ms: get_u64(&d, "default_ban_ms", 5 * 60_000),
         selector: parse_selector(&d, &Selector::BestLatency),
         hedge: parse_hedge(&d, &base_hedge),
@@ -324,6 +331,11 @@ pub fn parse_router_config(_lua: &Lua, cfg: &Table) -> Result<RouterConfig, Stri
             }
         }
 
+        let prefer_tags = match route.get::<Value>("prefer_tags") {
+            Ok(Value::Table(_)) => get_string_list(&route, "prefer_tags"),
+            _ => defaults.prefer_tags.clone(),
+        };
+
         let selector = parse_selector(&route, &defaults.selector);
         let hedge = parse_hedge(&route, &defaults.hedge);
 
@@ -339,6 +351,7 @@ pub fn parse_router_config(_lua: &Lua, cfg: &Table) -> Result<RouterConfig, Stri
             matcher,
             pool_all_tags,
             pool_any_tags,
+            prefer_tags,
             selector,
             hedge,
             max_attempts: get_usize(&route, "max_attempts", defaults.max_attempts).max(1),
