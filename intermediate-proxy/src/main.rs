@@ -40,6 +40,10 @@ async fn main() {
     let max_concurrent_probes = env_u64("MAX_CONCURRENT_PROBES", 16) as usize;
     let instr_limit = env_u64("LUA_INSTRUCTION_LIMIT", 1_000_000) as u32;
     let max_hard_attempts = env_u64("MAX_HARD_ATTEMPTS", 20) as usize;
+    let transport_probe_url =
+        env_string("TRANSPORT_PROBE_URL", "https://www.google.com/generate_204");
+    let transport_probe_interval_ms = env_u64("TRANSPORT_PROBE_INTERVAL_MS", 10_000);
+    let transport_probe_timeout_ms = env_u64("TRANSPORT_PROBE_TIMEOUT_MS", 8_000);
 
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -79,6 +83,13 @@ async fn main() {
     tokio::spawn(route::prober::run_route_prober(
         Arc::clone(&pool),
         Arc::clone(&lua),
+        max_concurrent_probes,
+    ));
+    tokio::spawn(route::prober::run_transport_prober(
+        Arc::clone(&pool),
+        transport_probe_url,
+        Duration::from_millis(transport_probe_interval_ms),
+        Duration::from_millis(transport_probe_timeout_ms),
         max_concurrent_probes,
     ));
 

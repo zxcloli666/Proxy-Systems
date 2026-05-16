@@ -211,9 +211,12 @@ impl Entry {
 
 /// A connect-class transport error means the proxy is unreachable for *every*
 /// route, so it gets the global fatal flag rather than a per-route ban.
+///
+/// A request *timeout* is deliberately NOT here: under load a slow target
+/// makes healthy proxies time out, and globally sidelining them collapses the
+/// pool. Timeouts stay a per-route soft failure instead.
 pub fn is_transport_fatal_reason(reason: &str) -> bool {
     reason.contains("client error (Connect)")
-        || reason.starts_with("timeout ")
         || reason.contains("dns error")
         || reason.contains("Connection refused")
 }

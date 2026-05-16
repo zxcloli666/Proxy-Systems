@@ -126,3 +126,63 @@ pub async fn run_route_prober(
         }
     }
 }
+
+/// Fast global recovery for proxies flagged `transport_fatal` (connect-class
+/// dead). Independent of per-route probe intervals: a proxy that briefly lost
+/// connectivity must come back in seconds, not after some route's 5–10 min
+/// probe. Any HTTP response through it (regardless of status) proves the hop
+/// is alive and clears the flag.
+pub async fn run_transport_prober(
+    pool: Arc<ProxyPool>,
+    probe_url: String,
+    interval: Duration,
+    timeout: Duration,
+    max_concurrent: usize,
+) {
+    if probe_url.is_empty() || interval.is_zero() {
+        info!("transport prober disabled");
+        return;
+    }
+    info!(
+        "transport prober: every {}ms via {}",
+        interval.as_millis(),
+        probe_url
+    );
+    let sem = Arc::new(Semaphore::new(max_concurrent.max(1)));
+    loop {
+        tokio::time::sleep(interval).await;
+        let snap = pool.snapshot();
+        for entry in snap.iter() {
+            if !entry.is_transport_fatal() {
+                continue;
+            }
+            let permit = match Arc::clone(&sem).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let entry = Arc::clone(entry);
+            let url = probe_url.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match probe_request(&entry.upstream, &url, timeout, 0).await {
+                    Ok(reply) => {
+                        if entry.clear_transport_fatal() {
+                            info!(
+                                "transport prober: {} reachable again ({}) → restored",
+                                sanitize_url(&entry.url),
+                                reply.status
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        debug!(
+                            "transport prober: {} still down: {}",
+                            sanitize_url(&entry.url),
+                            reason
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
