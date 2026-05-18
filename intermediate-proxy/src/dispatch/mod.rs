@@ -176,7 +176,7 @@ fn record_failure(
     latency: Option<u64>,
     reason: &str,
     ban_ms: Option<u64>,
-    transport: bool,
+    global_fatal: bool,
 ) {
     let st = entry.route_state(route.id);
     st.observe_failure(latency, reason, route.slow_ms);
@@ -189,7 +189,7 @@ fn record_failure(
         .global
         .last_error_ms
         .store(crate::util::now_ms(), Ordering::Relaxed);
-    if transport && is_transport_fatal_reason(reason) && entry.mark_transport_fatal() {
+    if global_fatal && entry.mark_transport_fatal() {
         warn!(
             "marking {} transport-fatal: {}",
             sanitize_url(&entry.url),
@@ -244,19 +244,27 @@ async fn run_attempt(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             let reason = describe_reqwest_error(&e);
+            // Connect-phase failure (incl. connect timeout: reqwest's
+            // connect_timeout fires before our overall budget) = the proxy
+            // itself is down/cut → globally fatal. A post-connect error is
+            // not the proxy's reachability.
+            let proxy_dead = e.is_connect() || is_transport_fatal_reason(&reason);
             warn!(
                 "upstream {} error in {}ms: {}",
                 sanitize_url(&entry.url),
                 elapsed,
                 reason
             );
-            record_failure(entry, route, None, &reason, None, true);
+            record_failure(entry, route, None, &reason, None, proxy_dead);
             return Err(AttemptErr::Next { failed: None });
         }
         Err(_) => {
+            // Our overall budget elapsed *after* the proxy connected (connect
+            // has its own shorter timeout above) → the origin is slow, not the
+            // proxy. Per-route soft fail only, never globally fatal.
             let reason = format!("timeout {}ms", timeout.as_millis());
             warn!("upstream {} {}", sanitize_url(&entry.url), reason);
-            record_failure(entry, route, None, &reason, None, true);
+            record_failure(entry, route, None, &reason, None, false);
             return Err(AttemptErr::Next { failed: None });
         }
     };
@@ -279,7 +287,7 @@ async fn run_attempt(
             Ok(b) => b,
             Err(e) => {
                 let reason = describe_reqwest_error(&e);
-                record_failure(entry, route, Some(elapsed), &reason, None, true);
+                record_failure(entry, route, Some(elapsed), &reason, None, false);
                 return Err(AttemptErr::Next { failed: None });
             }
         };
@@ -332,7 +340,8 @@ async fn run_attempt(
                 Err(AttemptErr::Next { failed })
             }
             ResponseVerdict::HardFail { reason } => {
-                record_failure(entry, route, Some(elapsed), &reason, None, true);
+                let gf = is_transport_fatal_reason(&reason);
+                record_failure(entry, route, Some(elapsed), &reason, None, gf);
                 Err(AttemptErr::Next { failed: None })
             }
             ResponseVerdict::RetrySameProxy { delay_ms } => {

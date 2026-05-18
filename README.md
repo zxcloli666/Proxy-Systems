@@ -47,9 +47,13 @@ banned on `api-v2.soundcloud.com` is still used for `genius.com`; bans, probes,
 timeouts and the selector are all decided per route by an embedded Lua config.
 
 - **Per-route health** — every `(route, proxy)` pair tracks its own tier
-  (`healthy`/`slow`/`failed`/`banned`/`fatal`), EWMA latency and ban expiry. A
-  transport-level connect failure marks the proxy fatal globally (it's
-  unreachable everywhere); everything else is a per-route ban.
+  (`healthy`/`slow`/`failed`/`banned`/`fatal`), EWMA latency and ban expiry.
+  Only a connect-class failure (connection refused / DNS / connect error)
+  marks the proxy fatal *globally* (unreachable everywhere) — and a fast
+  global prober (`TRANSPORT_PROBE_*`, ~10 s) restores it the moment it
+  answers again. A request *timeout* is only a per-route soft failure (a slow
+  target must not sideline a healthy proxy for every route); everything else
+  is a per-route ban.
 - **Lua classification** — `on_response(ctx, res)` returns a verdict:
   `success`, `return_as_is` (target's fault — proxy fine), `retry_other_proxy`
   (ban this proxy on this route for `ban_for_ms`, try the next),
@@ -97,6 +101,9 @@ Wire API is unchanged: clients still send the base64 target in `X-Target`.
 | `LUA_VM_COUNT` | Number of pooled Lua VMs | `cpus×2` (min 4) |
 | `LUA_INSTRUCTION_LIMIT` | Per-call Lua instruction budget (0 = off) | `1000000` |
 | `MAX_HARD_ATTEMPTS` | Hard cap on `retry_all`/`wait_probe` rounds | `20` |
+| `TRANSPORT_PROBE_URL` | URL the fast global prober uses to recover connect-dead proxies (empty disables) | `https://www.google.com/generate_204` |
+| `TRANSPORT_PROBE_INTERVAL_MS` | How often connect-fatal proxies are re-probed | `10000` |
+| `TRANSPORT_PROBE_TIMEOUT_MS` | Per-probe timeout for the transport prober | `8000` |
 
 `routes.lua` missing or unparseable at startup is fatal (the proxy can't route
 without it). `proxies.txt` missing starts empty and warns — the watcher picks
