@@ -1,7 +1,9 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
+use axum::http::header::HeaderValue;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use base64::Engine;
 use proxy_common::response::text_response;
 use proxy_common::target::decode_target;
 use std::sync::Arc;
@@ -46,7 +48,16 @@ pub async fn x_target_handler(
 
 async fn serve(state: Arc<AppState>, target: String, req: Request<Body>) -> Response {
     let method = req.method().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+
+    // Endpoint-upstreams (simple-proxy / workers) read the target from the
+    // X-Target header. With the /x-target/<base64> path form the client never
+    // sends that header, so re-derive it from the decoded target. Idempotent
+    // for the header form (same value re-set).
+    let encoded = base64::engine::general_purpose::STANDARD.encode(target.as_bytes());
+    if let Ok(v) = HeaderValue::from_str(&encoded) {
+        headers.insert("x-target", v);
+    }
 
     let (host, path) = match Url::parse(&target) {
         Ok(u) => (u.host_str().unwrap_or("").to_string(), u.path().to_string()),
