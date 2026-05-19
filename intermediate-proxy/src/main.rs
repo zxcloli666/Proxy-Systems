@@ -103,6 +103,7 @@ async fn main() {
         .route("/health", get(health::health_handler))
         .route("/health/route/{name}", get(health::route_detail_handler))
         .route("/health/proxy", get(health::proxy_detail_handler))
+        .route("/x-target/{*encoded}", any(handler::x_target_handler))
         .route("/{*path}", any(handler::proxy_handler))
         .route("/", any(handler::proxy_handler))
         .layer(cors_layer())

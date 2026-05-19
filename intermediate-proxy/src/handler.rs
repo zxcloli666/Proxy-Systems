@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use proxy_common::response::text_response;
@@ -15,10 +15,8 @@ use crate::AppState;
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-
-    let target = match headers
+    let target = match req
+        .headers()
         .get("x-target")
         .and_then(|v| v.to_str().ok())
         .and_then(decode_target)
@@ -26,12 +24,32 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         Some(t) => t,
         None => return text_response(StatusCode::BAD_REQUEST, "Missing or invalid X-Target"),
     };
+    serve(state, target, req).await
+}
+
+pub async fn x_target_handler(
+    State(state): State<Arc<AppState>>,
+    Path(encoded): Path<String>,
+    req: Request<Body>,
+) -> Response {
+    let target = match decode_target(encoded.trim_end_matches('/')) {
+        Some(t) => t,
+        None => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid /x-target/<base64> path segment",
+            )
+        }
+    };
+    serve(state, target, req).await
+}
+
+async fn serve(state: Arc<AppState>, target: String, req: Request<Body>) -> Response {
+    let method = req.method().clone();
+    let headers = req.headers().clone();
 
     let (host, path) = match Url::parse(&target) {
-        Ok(u) => (
-            u.host_str().unwrap_or("").to_string(),
-            u.path().to_string(),
-        ),
+        Ok(u) => (u.host_str().unwrap_or("").to_string(), u.path().to_string()),
         Err(_) => return text_response(StatusCode::BAD_REQUEST, "Invalid target URL"),
     };
 
@@ -70,10 +88,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         );
     };
 
-    debug!(
-        "{} {}{} → route '{}'",
-        method, host, path, route.name
-    );
+    debug!("{} {}{} → route '{}'", method, host, path, route.name);
 
     dispatch::run(
         Arc::clone(&state.pool),
