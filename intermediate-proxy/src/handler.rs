@@ -26,7 +26,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request<Body
         Some(t) => t,
         None => return text_response(StatusCode::BAD_REQUEST, "Missing or invalid X-Target"),
     };
-    serve(state, target, req).await
+    serve(state, target, req, None).await
 }
 
 pub async fn x_target_handler(
@@ -43,10 +43,20 @@ pub async fn x_target_handler(
             )
         }
     };
-    serve(state, target, req).await
+    let self_host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    serve(state, target, req, self_host).await
 }
 
-async fn serve(state: Arc<AppState>, target: String, req: Request<Body>) -> Response {
+async fn serve(
+    state: Arc<AppState>,
+    target: String,
+    req: Request<Body>,
+    rewrite_to_self: Option<String>,
+) -> Response {
     let method = req.method().clone();
     let mut headers = req.headers().clone();
 
@@ -101,7 +111,8 @@ async fn serve(state: Arc<AppState>, target: String, req: Request<Body>) -> Resp
 
     debug!("{} {}{} → route '{}'", method, host, path, route.name);
 
-    dispatch::run(
+    let target_url = target.clone();
+    let mut response = dispatch::run(
         Arc::clone(&state.pool),
         Arc::clone(&state.lua),
         route,
@@ -115,5 +126,48 @@ async fn serve(state: Arc<AppState>, target: String, req: Request<Body>) -> Resp
         },
         state.max_hard_attempts,
     )
-    .await
+    .await;
+
+    if let Some(self_host) = rewrite_to_self {
+        rewrite_location_to_self(&mut response, &target_url, &self_host);
+    }
+    response
+}
+
+fn rewrite_location_to_self(resp: &mut Response, target_url: &str, self_host: &str) {
+    if !resp.status().is_redirection() {
+        return;
+    }
+    let Some(loc) = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    let absolute = if loc.starts_with("http://") || loc.starts_with("https://") {
+        loc
+    } else {
+        let Ok(base) = Url::parse(target_url) else {
+            return;
+        };
+        let Ok(joined) = base.join(&loc) else {
+            return;
+        };
+        joined.to_string()
+    };
+
+    if let Ok(u) = Url::parse(&absolute) {
+        if u.host_str() == Some(self_host) {
+            return;
+        }
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(absolute.as_bytes());
+    let new_loc = format!("https://{self_host}/x-target/{encoded}");
+    if let Ok(v) = HeaderValue::from_str(&new_loc) {
+        resp.headers_mut().insert("location", v);
+    }
 }
