@@ -23,14 +23,20 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
+    let auth_token = std::env::var("AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(std::sync::Arc::<str>::from);
+    let auth_enabled = auth_token.is_some();
+
     let app = Router::new()
         .route("/{*path}", any(handler::proxy_handler))
         .route("/", any(handler::proxy_handler))
         .layer(cors_layer())
-        .with_state(client);
+        .with_state(handler::AppState { client, auth_token });
 
     let listener = bind_tcp(port).await;
-    info!("Simple Proxy running on http://0.0.0.0:{port}");
+    info!("Simple Proxy running on http://0.0.0.0:{port} (auth required: {auth_enabled})");
 
     axum::serve(listener, app).await.expect("server error");
 }

@@ -12,9 +12,36 @@ use url::Url;
 
 use crate::redirect::resolve_redirect;
 
-pub async fn proxy_handler(State(client): State<Client>, req: Request<Body>) -> Response {
+#[derive(Clone)]
+pub struct AppState {
+    pub client: Client,
+    pub auth_token: Option<std::sync::Arc<str>>,
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
+
+    if let Some(expected) = state.auth_token.as_deref() {
+        let provided = headers
+            .get("x-proxy-auth")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+            return text_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+        }
+    }
 
     let target_header = match headers.get("x-target").and_then(|v| v.to_str().ok()) {
         Some(v) => v.to_string(),
@@ -42,7 +69,8 @@ pub async fn proxy_handler(State(client): State<Client>, req: Request<Body>) -> 
     };
 
     // Build reqwest request
-    let mut req_builder = client
+    let mut req_builder = state
+        .client
         .request(method.clone(), &target_url)
         .headers(reqwest_headers(&filtered_headers));
 

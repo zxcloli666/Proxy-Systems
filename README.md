@@ -14,6 +14,12 @@ Basic reverse proxy. Receives the target URL as a base64-encoded `X-Target` head
 
 **Port:** `8080` (env `PORT`)
 
+| Env | Description | Default |
+|-----|-------------|---------|
+| `AUTH_TOKEN` | When set, callers must send `X-Proxy-Auth: <token>` or get `401`. Compared in constant time and stripped before forwarding, so the token never reaches the target. Empty/unset = open proxy (default). | — |
+
+Set it on any instance reachable from the internet — an open `X-Target` proxy will be found and abused. `intermediate-proxy` can attach the header per route with `add_headers` in `routes.lua`.
+
 ### simple-ipv6-proxy
 
 IPv6-only variant of `simple-proxy`. Resolves the target via AAAA records only and connects over IPv6. If the target has no IPv6 address (or all IPv6 attempts fail), it returns `502` so `intermediate-proxy` fails over to the next upstream.
