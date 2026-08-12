@@ -17,6 +17,9 @@ Basic reverse proxy. Receives the target URL as a base64-encoded `X-Target` head
 | Env | Description | Default |
 |-----|-------------|---------|
 | `AUTH_TOKEN` | When set, callers must send `X-Proxy-Auth: <token>` or get `401`. Compared in constant time and stripped before forwarding, so the token never reaches the target. Empty/unset = open proxy (default). | — |
+| `IMPERSONATE` | Browser profile for the outgoing TLS/HTTP2 fingerprint (`chrome_133`, `firefox_136`, `safari_18`, …). Unset = plain rustls over HTTP/1.1 (default, unchanged behavior). | — |
+
+**Why `IMPERSONATE` matters**: the proxy — not the caller — terminates TLS with the target, so the target sees *its* fingerprint. Defaults look like `t13d1011h1_…` (rustls, HTTP/1.1), which several Russian classifieds now block outright: measured on the same IP in the same second, plain curl got `200` with real data while this proxy got a captcha redirect. With `IMPERSONATE=chrome_133` the JA4 becomes `t13d1516h2_…` over h2 with Chrome's Akamai HTTP/2 signature. Profile names are the serde names of `wreq_util::Emulation`.
 
 Set it on any instance reachable from the internet — an open `X-Target` proxy will be found and abused. `intermediate-proxy` can attach the header per route with `add_headers` in `routes.lua`.
 

@@ -1,4 +1,5 @@
 mod handler;
+mod outbound;
 mod redirect;
 
 use axum::routing::any;
@@ -29,14 +30,32 @@ async fn main() {
         .map(std::sync::Arc::<str>::from);
     let auth_enabled = auth_token.is_some();
 
+    let impersonate = std::env::var("IMPERSONATE").ok().filter(|p| !p.is_empty());
+    let outbound = match &impersonate {
+        Some(profile) => match outbound::Outbound::emulated(profile) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            }
+        },
+        None => outbound::Outbound::plain(client),
+    };
+
     let app = Router::new()
         .route("/{*path}", any(handler::proxy_handler))
         .route("/", any(handler::proxy_handler))
         .layer(cors_layer())
-        .with_state(handler::AppState { client, auth_token });
+        .with_state(handler::AppState {
+            client: std::sync::Arc::new(outbound),
+            auth_token,
+        });
 
     let listener = bind_tcp(port).await;
-    info!("Simple Proxy running on http://0.0.0.0:{port} (auth required: {auth_enabled})");
+    info!(
+        "Simple Proxy running on http://0.0.0.0:{port} (auth required: {auth_enabled}, impersonate: {})",
+        impersonate.as_deref().unwrap_or("off")
+    );
 
     axum::serve(listener, app).await.expect("server error");
 }

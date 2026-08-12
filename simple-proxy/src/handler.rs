@@ -6,7 +6,6 @@ use proxy_common::cors::cors_headers;
 use proxy_common::headers::{filter_request_headers, filter_response_headers};
 use proxy_common::response::text_response;
 use proxy_common::target::decode_target;
-use reqwest::Client;
 use tracing::info;
 use url::Url;
 
@@ -14,7 +13,7 @@ use crate::redirect::resolve_redirect;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub client: Client,
+    pub client: std::sync::Arc<crate::outbound::Outbound>,
     pub auth_token: Option<std::sync::Arc<str>>,
 }
 
@@ -68,17 +67,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         Err(_) => return text_response(StatusCode::BAD_REQUEST, "Failed to read request body"),
     };
 
-    // Build reqwest request
-    let mut req_builder = state
+    let outbound_body = if method != Method::GET && method != Method::HEAD && !body_bytes.is_empty()
+    {
+        Some(body_bytes)
+    } else {
+        None
+    };
+
+    let response = match state
         .client
-        .request(method.clone(), &target_url)
-        .headers(reqwest_headers(&filtered_headers));
-
-    if method != Method::GET && method != Method::HEAD && !body_bytes.is_empty() {
-        req_builder = req_builder.body(body_bytes);
-    }
-
-    let response = match req_builder.send().await {
+        .send(&method, &target_url, &filtered_headers, outbound_body)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Proxy error: {}", e);
@@ -89,8 +89,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         }
     };
 
-    let status = response.status();
-    let resp_headers = response.headers().clone();
+    let status = response.status;
+    let resp_headers = response.headers.clone();
 
     // Handle redirects
     if status.is_redirection() {
@@ -133,7 +133,7 @@ fn build_redirect_response(
 async fn build_stream_response(
     status: StatusCode,
     resp_headers: &HeaderMap,
-    response: reqwest::Response,
+    response: crate::outbound::UpstreamResponse,
 ) -> Response {
     let filtered = filter_response_headers(resp_headers);
     let mut builder = Response::builder().status(status);
@@ -146,22 +146,5 @@ async fn build_stream_response(
         hdrs.append(name.clone(), value.clone());
     }
 
-    let stream = response.bytes_stream();
-    let body = Body::from_stream(stream);
-
-    builder.body(body).unwrap()
-}
-
-/// Convert axum HeaderMap to reqwest HeaderMap.
-fn reqwest_headers(headers: &HeaderMap) -> reqwest::header::HeaderMap {
-    let mut out = reqwest::header::HeaderMap::new();
-    for (name, value) in headers.iter() {
-        if let (Ok(n), Ok(v)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            out.append(n, v);
-        }
-    }
-    out
+    builder.body(Body::from_stream(response.stream)).unwrap()
 }
