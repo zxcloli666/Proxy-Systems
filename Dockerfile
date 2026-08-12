@@ -14,7 +14,7 @@ FROM rust:1-alpine AS builder
 # gcc: mlua `vendored` compiles Lua 5.4 C sources via the cc crate.
 # git/go/g++/linux-headers: boring-sys2 (wreq impersonation) patches and builds
 # BoringSSL from source — it runs `git init` and needs a Go toolchain.
-RUN apk add --no-cache musl-dev cmake make perl gcc g++ git go linux-headers
+RUN apk add --no-cache musl-dev cmake make perl gcc g++ git go linux-headers clang-dev llvm-dev
 WORKDIR /build
 
 # === Layer 1: dependency cache ===
