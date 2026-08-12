@@ -43,6 +43,7 @@ IPv6-only variant of `simple-proxy`. Resolves the target via AAAA records only a
 | `REQUEST_TIMEOUT_MS` | HTTP request timeout per attempt | `30000` |
 | `MAX_ATTEMPTS` | Total attempts per request (retries with fresh random source on connect error or ban-status) | `3` |
 | `RETRY_STATUS_CODES` | Upstream status codes that trigger a retry | `403,429` |
+| `IMPERSONATE` | Browser profile for the outgoing TLS/HTTP2 fingerprint (same values as `simple-proxy`). Source-address rotation is preserved — each attempt binds a fresh address from `IPV6_SUBNET` and pins the target to the resolved AAAA. Unset = plain rustls over HTTP/1.1 (default). | — |
 
 For subnet rotation to work:
 1. The prefix must be routed to this host (the hoster's routing, not just `ip addr add`).

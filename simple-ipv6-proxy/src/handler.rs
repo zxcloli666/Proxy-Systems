@@ -33,6 +33,7 @@ pub struct HandlerState {
     pub request_timeout: Duration,
     pub max_attempts: u32,
     pub retry_codes: Arc<Vec<u16>>,
+    pub emulator: Option<Arc<crate::emulated::Emulator>>,
 }
 
 pub async fn proxy_handler(State(state): State<HandlerState>, req: Request<Body>) -> Response {
@@ -217,7 +218,7 @@ fn is_blocked_hostname(host: &str) -> bool {
     )
 }
 
-type UpstreamResponse = (StatusCode, HeaderMap, hyper::body::Incoming);
+type UpstreamResponse = (StatusCode, HeaderMap, Body);
 
 async fn dispatch(
     state: &HandlerState,
@@ -230,6 +231,25 @@ async fn dispatch(
     body: Bytes,
 ) -> Result<UpstreamResponse, Box<dyn std::error::Error + Send + Sync>> {
     let subnet_ref = state.subnet.as_ref().as_ref();
+
+    if let Some(emulator) = &state.emulator {
+        let scheme = if is_https { "https" } else { "http" };
+        let url = format!("{scheme}://{host}{path_and_query}");
+        let source = subnet_ref.map(|s| IpAddr::V6(s.random_addr()));
+        return emulator
+            .send(
+                target,
+                source,
+                &url,
+                host,
+                method,
+                headers,
+                body,
+                state.request_timeout,
+            )
+            .await;
+    }
+
     let stream = connect_ipv6(target, subnet_ref, state.connect_timeout).await?;
 
     debug!("connected to {}", target);
@@ -317,7 +337,14 @@ where
         }
     }
 
-    Ok((status, resp_headers, response.into_body()))
+    let stream = BodyStream::new(response.into_body()).filter_map(|frame| async move {
+        match frame {
+            Ok(f) => f.into_data().ok().map(Ok),
+            Err(e) => Some(Err(e)),
+        }
+    });
+
+    Ok((status, resp_headers, Body::from_stream(stream)))
 }
 
 fn build_redirect_response(
@@ -342,11 +369,7 @@ fn build_redirect_response(
     builder.body(Body::empty()).unwrap()
 }
 
-fn build_stream_response(
-    status: StatusCode,
-    resp_headers: &HeaderMap,
-    body: hyper::body::Incoming,
-) -> Response {
+fn build_stream_response(status: StatusCode, resp_headers: &HeaderMap, body: Body) -> Response {
     let filtered = filter_response_headers(resp_headers);
     let mut builder = Response::builder().status(status);
     let hdrs = builder.headers_mut().unwrap();
@@ -357,11 +380,5 @@ fn build_stream_response(
         hdrs.append(name.clone(), value.clone());
     }
 
-    let stream = BodyStream::new(body).filter_map(|frame| async move {
-        match frame {
-            Ok(f) => f.into_data().ok().map(Ok),
-            Err(e) => Some(Err(e)),
-        }
-    });
-    builder.body(Body::from_stream(stream)).unwrap()
+    builder.body(body).unwrap()
 }

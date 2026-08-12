@@ -1,4 +1,5 @@
 mod connect;
+mod emulated;
 mod filter;
 mod handler;
 mod redirect;
@@ -42,12 +43,28 @@ async fn main() {
         max_attempts, retry_codes
     );
 
+    let impersonate = std::env::var("IMPERSONATE").ok().filter(|p| !p.is_empty());
+    let emulator = match &impersonate {
+        Some(profile) => match emulated::Emulator::new(profile) {
+            Ok(e) => {
+                info!("Impersonation profile: {profile}");
+                Some(Arc::new(e))
+            }
+            Err(e) => {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     let state = HandlerState {
         subnet: Arc::new(subnet),
         connect_timeout,
         request_timeout,
         max_attempts,
         retry_codes: Arc::new(retry_codes),
+        emulator,
     };
 
     let app = Router::new()
