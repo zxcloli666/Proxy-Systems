@@ -5,34 +5,79 @@ use futures_util::StreamExt;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
+pub const DEFAULT_PROFILE: &str = "chrome_137";
+
+pub struct Hop<'a> {
+    pub target: SocketAddrV6,
+    pub source: Option<IpAddr>,
+    pub url: &'a str,
+    pub host: &'a str,
+    pub method: &'a Method,
+    pub headers: &'a HeaderMap,
+    pub body: Bytes,
+    pub request_timeout: Duration,
+    pub connect_timeout: Duration,
+}
+
 #[derive(Clone)]
 pub struct Emulator {
     emulation: wreq_util::Emulation,
+    profile: String,
+}
+
+fn parse_profile(name: &str) -> Option<wreq_util::Emulation> {
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
 }
 
 impl Emulator {
-    pub fn new(profile: &str) -> Result<Self, String> {
-        let emulation: wreq_util::Emulation =
-            serde_json::from_value(serde_json::Value::String(profile.to_string()))
-                .map_err(|_| format!("unknown impersonation profile: {profile}"))?;
-        Ok(Self { emulation })
+    pub fn new(profile: Option<&str>) -> Result<Self, String> {
+        let requested = profile
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(DEFAULT_PROFILE);
+
+        let (profile, emulation) = match parse_profile(requested) {
+            Some(e) => (requested.to_string(), e),
+            None => {
+                tracing::warn!(
+                    requested,
+                    fallback = DEFAULT_PROFILE,
+                    "unknown impersonation profile"
+                );
+                let e = parse_profile(DEFAULT_PROFILE)
+                    .ok_or_else(|| format!("built-in profile {DEFAULT_PROFILE} is unknown"))?;
+                (DEFAULT_PROFILE.to_string(), e)
+            }
+        };
+
+        Ok(Self { emulation, profile })
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
     }
 
     pub async fn send(
         &self,
-        target: SocketAddrV6,
-        source: Option<IpAddr>,
-        url: &str,
-        host: &str,
-        method: &Method,
-        headers: &HeaderMap,
-        body: Bytes,
-        request_timeout: Duration,
+        hop: Hop<'_>,
     ) -> Result<(StatusCode, HeaderMap, Body), Box<dyn std::error::Error + Send + Sync>> {
+        let Hop {
+            target,
+            source,
+            url,
+            host,
+            method,
+            headers,
+            body,
+            request_timeout,
+            connect_timeout,
+        } = hop;
+
         let mut builder = wreq::Client::builder()
             .emulation(self.emulation)
             .redirect(wreq::redirect::Policy::none())
             .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
             .resolve_to_addrs(host, &[SocketAddr::V6(target)]);
 
         if let Some(src) = source {

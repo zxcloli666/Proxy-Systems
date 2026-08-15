@@ -7,19 +7,14 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::StreamExt;
-use http_body_util::{BodyStream, Full};
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
 use proxy_common::cors::cors_headers;
 use proxy_common::headers::{filter_request_headers, filter_response_headers};
 use proxy_common::response::text_response;
 use proxy_common::target::decode_target;
-use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::connect::{connect_ipv6, resolve_ipv6};
+use crate::connect::resolve_ipv6;
 use crate::filter;
 use crate::redirect::resolve_redirect;
 use crate::subnet::Subnet;
@@ -33,7 +28,7 @@ pub struct HandlerState {
     pub request_timeout: Duration,
     pub max_attempts: u32,
     pub retry_codes: Arc<Vec<u16>>,
-    pub emulator: Option<Arc<crate::emulated::Emulator>>,
+    pub emulator: Arc<crate::emulated::Emulator>,
 }
 
 pub async fn proxy_handler(State(state): State<HandlerState>, req: Request<Body>) -> Response {
@@ -137,13 +132,15 @@ pub async fn proxy_handler(State(state): State<HandlerState>, req: Request<Body>
         let target = v6_addrs[attempt % v6_addrs.len()];
         match dispatch(
             &state,
-            target,
-            is_https,
-            &host,
-            &path_and_query,
-            &method,
-            &filtered,
-            req_body.clone(),
+            Attempt {
+                target,
+                is_https,
+                host: &host,
+                path_and_query: &path_and_query,
+                method: &method,
+                headers: &filtered,
+                body: req_body.clone(),
+            },
         )
         .await
         {
@@ -220,131 +217,53 @@ fn is_blocked_hostname(host: &str) -> bool {
 
 type UpstreamResponse = (StatusCode, HeaderMap, Body);
 
-async fn dispatch(
-    state: &HandlerState,
+struct Attempt<'a> {
     target: SocketAddrV6,
     is_https: bool,
-    host: &str,
-    path_and_query: &str,
-    method: &Method,
-    headers: &HeaderMap,
+    host: &'a str,
+    path_and_query: &'a str,
+    method: &'a Method,
+    headers: &'a HeaderMap,
     body: Bytes,
-) -> Result<UpstreamResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let subnet_ref = state.subnet.as_ref().as_ref();
-
-    if let Some(emulator) = &state.emulator {
-        let scheme = if is_https { "https" } else { "http" };
-        let url = format!("{scheme}://{host}{path_and_query}");
-        let source = subnet_ref.map(|s| IpAddr::V6(s.random_addr()));
-        return emulator
-            .send(
-                target,
-                source,
-                &url,
-                host,
-                method,
-                headers,
-                body,
-                state.request_timeout,
-            )
-            .await;
-    }
-
-    let stream = connect_ipv6(target, subnet_ref, state.connect_timeout).await?;
-
-    debug!("connected to {}", target);
-
-    if is_https {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(config));
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
-        let tls_stream = connector.connect(server_name, stream).await?;
-        send_request(
-            TokioIo::new(tls_stream),
-            host,
-            path_and_query,
-            method,
-            headers,
-            body,
-            state.request_timeout,
-        )
-        .await
-    } else {
-        send_request(
-            TokioIo::new(stream),
-            host,
-            path_and_query,
-            method,
-            headers,
-            body,
-            state.request_timeout,
-        )
-        .await
-    }
 }
 
-async fn send_request<S>(
-    io: TokioIo<S>,
-    host: &str,
-    path_and_query: &str,
-    method: &Method,
-    headers: &HeaderMap,
-    body: Bytes,
-    request_timeout: Duration,
-) -> Result<UpstreamResponse, Box<dyn std::error::Error + Send + Sync>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = http1::handshake(io).await?;
+async fn dispatch(
+    state: &HandlerState,
+    attempt: Attempt<'_>,
+) -> Result<UpstreamResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let Attempt {
+        target,
+        is_https,
+        host,
+        path_and_query,
+        method,
+        headers,
+        body,
+    } = attempt;
+    let source = state
+        .subnet
+        .as_ref()
+        .as_ref()
+        .map(|s| IpAddr::V6(s.random_addr()));
+    let scheme = if is_https { "https" } else { "http" };
+    let url = format!("{scheme}://{host}{path_and_query}");
 
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            debug!("upstream conn closed: {}", e);
-        }
-    });
+    debug!("dispatching to {} via {:?}", target, source);
 
-    let mut builder = hyper::Request::builder()
-        .method(method.as_str())
-        .uri(path_and_query)
-        .header("host", host);
-
-    for (name, value) in headers.iter() {
-        if name.as_str().eq_ignore_ascii_case("host") {
-            continue;
-        }
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-
-    let req = builder.body(Full::new(body))?;
-    let response = tokio::time::timeout(request_timeout, sender.send_request(req))
+    state
+        .emulator
+        .send(crate::emulated::Hop {
+            target,
+            source,
+            url: &url,
+            host,
+            method,
+            headers,
+            body,
+            request_timeout: state.request_timeout,
+            connect_timeout: state.connect_timeout,
+        })
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream timeout"))??;
-
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-
-    let mut resp_headers = HeaderMap::new();
-    for (name, value) in response.headers() {
-        if let (Ok(n), Ok(v)) = (
-            axum::http::HeaderName::from_bytes(name.as_str().as_bytes()),
-            HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            resp_headers.append(n, v);
-        }
-    }
-
-    let stream = BodyStream::new(response.into_body()).filter_map(|frame| async move {
-        match frame {
-            Ok(f) => f.into_data().ok().map(Ok),
-            Err(e) => Some(Err(e)),
-        }
-    });
-
-    Ok((status, resp_headers, Body::from_stream(stream)))
 }
 
 fn build_redirect_response(

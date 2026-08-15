@@ -17,9 +17,11 @@ Basic reverse proxy. Receives the target URL as a base64-encoded `X-Target` head
 | Env | Description | Default |
 |-----|-------------|---------|
 | `AUTH_TOKEN` | When set, callers must send `X-Proxy-Auth: <token>` or get `401`. Compared in constant time and stripped before forwarding, so the token never reaches the target. Empty/unset = open proxy (default). | — |
-| `IMPERSONATE` | Browser profile for the outgoing TLS/HTTP2 fingerprint (`chrome_133`, `firefox_136`, `safari_18`, …). Unset = plain rustls over HTTP/1.1 (default, unchanged behavior). | — |
+| `IMPERSONATE` | Browser profile for the outgoing TLS/HTTP2 fingerprint (`chrome_137`, `firefox_139`, `safari_18`, …). | `chrome_137` |
 
-**Why `IMPERSONATE` matters**: the proxy — not the caller — terminates TLS with the target, so the target sees *its* fingerprint. Defaults look like `t13d1011h1_…` (rustls, HTTP/1.1), which several Russian classifieds now block outright: measured on the same IP in the same second, plain curl got `200` with real data while this proxy got a captcha redirect. With `IMPERSONATE=chrome_133` the JA4 becomes `t13d1516h2_…` over h2 with Chrome's Akamai HTTP/2 signature. Profile names are the serde names of `wreq_util::Emulation`.
+**Impersonation is always on** — there is no plain-rustls path any more. The proxy, not the caller, terminates TLS with the target, so the target fingerprints *this process*. A rustls handshake (`t13d1011h1_…`, HTTP/1.1) is trivially identifiable and several Russian classifieds block it outright: measured on the same IP in the same second, plain curl got `200` with real data while this proxy got a captcha redirect. Every request now goes out as a real browser (`t13d1516h2_…` over h2 with Chrome's Akamai HTTP/2 signature).
+
+`IMPERSONATE` only chooses *which* browser. Profile names are the serde names of `wreq_util::Emulation` — `chrome_100`…`chrome_137`, `firefox_109`…`firefox_139`, `safari_16`/`safari_18`, `edge_*`, `okhttp_5`. An unknown name logs a warning and falls back to the default rather than failing to start.
 
 Set it on any instance reachable from the internet — an open `X-Target` proxy will be found and abused. `intermediate-proxy` can attach the header per route with `add_headers` in `routes.lua`.
 
@@ -31,7 +33,7 @@ IPv6-only variant of `simple-proxy`. Resolves the target via AAAA records only a
 - **Source address rotation** — when `IPV6_SUBNET` is set, each attempt binds a fresh random IPv6 from that subnet. Useful on hosts with a routed `/64` (Hetzner, OVH, etc.): each outgoing request appears from a different source IP, which beats naive per-IP blocks.
 - **Ban-aware retry** — if the target replies with a status in `RETRY_STATUS_CODES` (default `403,429`) or the connection fails, retries up to `MAX_ATTEMPTS` times; each attempt picks a new random source address and rotates through resolved AAAA records. If all attempts fail, returns `502` so the caller can fail over.
 - **SSRF guard** — literal internal / loopback / link-local / ULA / CGN / documentation IPs are rejected outright; resolved AAAA addresses are filtered the same way.
-- **IPV6_FREEBIND** — set on the outgoing socket so the kernel accepts binding to any address in a routed prefix, even if it isn't configured on a local interface.
+- **Non-local bind** — binding an address that is routed to the host but not assigned to an interface needs `net.ipv6.ip_nonlocal_bind=1`. On start, when `IPV6_SUBNET` is set, the proxy enables it itself (needs `CAP_NET_ADMIN` or a writable `/proc/sys`) and logs an actionable error if it cannot, because without it every rotated source fails with `EADDRNOTAVAIL`.
 - **Streaming response body** — via hyper + rustls, same as `simple-proxy`.
 
 **Port:** `8080` (env `PORT`)
@@ -43,11 +45,11 @@ IPv6-only variant of `simple-proxy`. Resolves the target via AAAA records only a
 | `REQUEST_TIMEOUT_MS` | HTTP request timeout per attempt | `30000` |
 | `MAX_ATTEMPTS` | Total attempts per request (retries with fresh random source on connect error or ban-status) | `3` |
 | `RETRY_STATUS_CODES` | Upstream status codes that trigger a retry | `403,429` |
-| `IMPERSONATE` | Browser profile for the outgoing TLS/HTTP2 fingerprint (same values as `simple-proxy`). Source-address rotation is preserved — each attempt binds a fresh address from `IPV6_SUBNET` and pins the target to the resolved AAAA. Unset = plain rustls over HTTP/1.1 (default). | — |
+| `IMPERSONATE` | Browser profile for the outgoing TLS/HTTP2 fingerprint (same values as `simple-proxy`). Always on; source-address rotation is preserved — each attempt binds a fresh address from `IPV6_SUBNET` and pins the target to the resolved AAAA. | `chrome_137` |
 
 For subnet rotation to work:
 1. The prefix must be routed to this host (the hoster's routing, not just `ip addr add`).
-2. On Linux, either set `net.ipv6.ip_nonlocal_bind=1` or run with `CAP_NET_ADMIN`; the proxy also sets `IPV6_FREEBIND` per-socket for reliability.
+2. The proxy sets `net.ipv6.ip_nonlocal_bind=1` at startup, so give it `CAP_NET_ADMIN` (or pass `--sysctl net.ipv6.ip_nonlocal_bind=1`); with `network_mode: host` that toggle applies to the host itself.
 3. Container must have IPv6 enabled (Docker: `--sysctl net.ipv6.conf.all.disable_ipv6=0`, plus network configured with an IPv6 subnet).
 
 ### intermediate-proxy

@@ -2,6 +2,7 @@ mod connect;
 mod emulated;
 mod filter;
 mod handler;
+mod nonlocal_bind;
 mod redirect;
 mod subnet;
 
@@ -30,33 +31,30 @@ async fn main() {
     let subnet = Subnet::from_env();
 
     match &subnet {
-        Some(s) => info!(
-            "IPv6 source subnet: {}/{} (random source per attempt)",
-            s.prefix, s.prefix_len
-        ),
-        None => info!(
-            "No IPV6_SUBNET configured; using default IPv6 source address"
-        ),
+        Some(s) => {
+            info!(
+                "IPv6 source subnet: {}/{} (random source per attempt)",
+                s.prefix, s.prefix_len
+            );
+            nonlocal_bind::report(nonlocal_bind::ensure());
+        }
+        None => info!("No IPV6_SUBNET configured; using default IPv6 source address"),
     }
     info!(
         "Max attempts: {} | retry on statuses: {:?}",
         max_attempts, retry_codes
     );
 
-    let impersonate = std::env::var("IMPERSONATE").ok().filter(|p| !p.is_empty());
-    let emulator = match &impersonate {
-        Some(profile) => match emulated::Emulator::new(profile) {
-            Ok(e) => {
-                info!("Impersonation profile: {profile}");
-                Some(Arc::new(e))
-            }
-            Err(e) => {
-                tracing::error!("{e}");
-                std::process::exit(1);
-            }
-        },
-        None => None,
+    let impersonate = std::env::var("IMPERSONATE").ok();
+    let emulator = match emulated::Emulator::new(impersonate.as_deref()) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
     };
+    info!("Impersonation profile: {}", emulator.profile());
+    let emulator = Arc::new(emulator);
 
     let state = HandlerState {
         subnet: Arc::new(subnet),
