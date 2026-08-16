@@ -91,6 +91,7 @@ pub async fn probe_request(
     probe_url: &str,
     timeout: Duration,
     capture_bytes: usize,
+    extra_headers: &[(String, String)],
 ) -> Result<ProbeReply, String> {
     let mut headers = HeaderMap::new();
     let encoded = base64::engine::general_purpose::STANDARD.encode(probe_url.as_bytes());
@@ -98,6 +99,14 @@ pub async fn probe_request(
         headers.insert("x-target", v);
     }
     headers.insert("accept", HeaderValue::from_static("*/*"));
+    for (name, value) in extra_headers {
+        if let (Ok(n), Ok(v)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
+    }
 
     let resp = match tokio::time::timeout(
         timeout,

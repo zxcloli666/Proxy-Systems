@@ -62,12 +62,15 @@ pub async fn run_route_prober(
                 let probe_url = probe.url.clone();
                 let ok_statuses = probe.ok_statuses.clone();
                 let has_classify = probe.has_classify;
+                let probe_headers = probe.headers.clone();
                 let timeout = Duration::from_millis(route.timeout_ms);
                 let cap = route.capture_body_bytes.max(if has_classify { 4096 } else { 0 });
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    match probe_request(&entry.upstream, &probe_url, timeout, cap).await {
+                    match probe_request(&entry.upstream, &probe_url, timeout, cap, &probe_headers)
+                        .await
+                    {
                         Ok(reply) => {
                             let outcome = if has_classify {
                                 lua.probe_classify(
@@ -164,7 +167,7 @@ pub async fn run_transport_prober(
             let url = probe_url.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                match probe_request(&entry.upstream, &url, timeout, 0).await {
+                match probe_request(&entry.upstream, &url, timeout, 0, &[]).await {
                     Ok(reply) => {
                         if entry.clear_transport_fatal() {
                             info!(

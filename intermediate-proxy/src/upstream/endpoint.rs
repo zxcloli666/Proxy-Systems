@@ -8,7 +8,6 @@ use reqwest::Client;
 /// ("Misdirected Request") because the SNI doesn't match the Host header.
 const SKIP_HEADERS: &[&str] = &[
     "host",
-    // Forced to `identity` below — see the insert after the header loop.
     "accept-encoding",
     "content-length",
     "transfer-encoding",
@@ -65,10 +64,6 @@ pub async fn forward(
         }
     }
 
-    // Never let the inner endpoint negotiate compression on our behalf: the
-    // chain strips `content-encoding` without decompressing, so a gzip/br body
-    // would reach the backend undecodable. The inner proxy forces this too, but
-    // setting it here keeps the whole hop chain on `identity`.
     req_headers.insert(
         reqwest::header::ACCEPT_ENCODING,
         reqwest::header::HeaderValue::from_static("identity"),

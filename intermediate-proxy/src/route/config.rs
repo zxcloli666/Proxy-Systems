@@ -48,6 +48,7 @@ pub struct ProbeCfg {
     pub interval_ms: u64,
     pub ok_statuses: Vec<u16>,
     pub has_classify: bool,
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -299,11 +300,20 @@ fn parse_probe(route: &Table) -> Option<ProbeCfg> {
         _ => vec![200],
     };
     let has_classify = matches!(p.get::<Value>("classify"), Ok(Value::Function(_)));
+    let headers: Vec<(String, String)> = match p.get::<Value>("headers") {
+        Ok(Value::Table(t)) => t
+            .pairs::<String, String>()
+            .filter_map(|pair| pair.ok())
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
+            .collect(),
+        _ => Vec::new(),
+    };
     Some(ProbeCfg {
         url,
         interval_ms: get_u64(&p, "interval_ms", 10 * 60_000),
         ok_statuses,
         has_classify,
+        headers,
     })
 }
 
