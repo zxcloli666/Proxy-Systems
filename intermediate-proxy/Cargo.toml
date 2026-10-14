@@ -21,6 +21,7 @@ base64 = { workspace = true }
 rustls = { workspace = true }
 rustls-acme = { workspace = true }
 axum-server = { workspace = true }
+socket2 = { workspace = true }
 mlua = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

@@ -1258,6 +1258,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "socket2 0.6.3",
  "tokio",
  "tokio-stream",
  "tracing",
