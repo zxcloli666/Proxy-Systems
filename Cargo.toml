@@ -30,8 +30,8 @@ futures-util = "0.3"
 tokio-stream = "0.1"
 webpki-roots = "1"
 arc-swap = "1"
-rustls-acme = { version = "0.14", features = ["axum"] }
-axum-server = "0.7"
+rustls-acme = { version = "0.15", features = ["axum"] }
+axum-server = "0.8"
 socket2 = { version = "0.6", features = ["all"] }
 mlua = { version = "0.10", features = ["lua54", "vendored", "send", "macros"] }
 dashmap = "6"
