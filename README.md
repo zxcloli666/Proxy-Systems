@@ -34,6 +34,7 @@ IPv6-only variant of `simple-proxy`. Resolves the target via AAAA records only a
 - **Ban-aware retry** — if the target replies with a status in `RETRY_STATUS_CODES` (default `403,429`) or the connection fails, retries up to `MAX_ATTEMPTS` times; each attempt picks a new random source address and rotates through resolved AAAA records. If all attempts fail, returns `502` so the caller can fail over.
 - **SSRF guard** — literal internal / loopback / link-local / ULA / CGN / documentation IPs are rejected outright; resolved AAAA addresses are filtered the same way.
 - **Non-local bind** — binding an address that is routed to the host but not assigned to an interface needs `net.ipv6.ip_nonlocal_bind=1`. On start, when `IPV6_SUBNET` is set, the proxy enables it itself (needs `CAP_NET_ADMIN` or a writable `/proc/sys`) and logs an actionable error if it cannot, because without it every rotated source fails with `EADDRNOTAVAIL`.
+- **Gateway NDP priming** — on hosts where the gateway resolves a new source address slowly (OVH: 3 to 25 s), each attempt first sends the gateway a neighbor solicitation from the rotated source with our MAC attached, so the SYN-ACK finds a neighbor entry. Needs `CAP_NET_RAW`. Gateway and interface come from `NDP_GATEWAY` and `NDP_IFACE`, defaulting to the IPv6 default route. A failed send is logged once a minute and the request goes on.
 - **Streaming response body** — via hyper + rustls, same as `simple-proxy`.
 
 **Port:** `8080` (env `PORT`)

@@ -2,6 +2,7 @@ mod connect;
 mod emulated;
 mod filter;
 mod handler;
+mod neighbor;
 mod nonlocal_bind;
 mod redirect;
 mod subnet;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::handler::HandlerState;
+use crate::neighbor::Primer;
 use crate::subnet::Subnet;
 
 #[tokio::main]
@@ -56,8 +58,11 @@ async fn main() {
     info!("Impersonation profile: {}", emulator.profile());
     let emulator = Arc::new(emulator);
 
+    let primer = subnet.as_ref().and_then(|_| Primer::from_env());
+
     let state = HandlerState {
         subnet: Arc::new(subnet),
+        primer: Arc::new(primer),
         connect_timeout,
         request_timeout,
         max_attempts,
