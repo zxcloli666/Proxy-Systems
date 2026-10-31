@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::connect::resolve_ipv6;
 use crate::filter;
+use crate::neighbor::Primer;
 use crate::redirect::resolve_redirect;
 use crate::subnet::Subnet;
 
@@ -24,6 +25,7 @@ const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
 #[derive(Clone)]
 pub struct HandlerState {
     pub subnet: Arc<Option<Subnet>>,
+    pub primer: Arc<Option<Primer>>,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub max_attempts: u32,
@@ -244,7 +246,11 @@ async fn dispatch(
         .subnet
         .as_ref()
         .as_ref()
-        .map(|s| IpAddr::V6(s.random_addr()));
+        .map(|s| s.random_addr());
+    if let (Some(addr), Some(primer)) = (source, state.primer.as_ref()) {
+        primer.prime(addr);
+    }
+    let source = source.map(IpAddr::V6);
     let scheme = if is_https { "https" } else { "http" };
     let url = format!("{scheme}://{host}{path_and_query}");
 
