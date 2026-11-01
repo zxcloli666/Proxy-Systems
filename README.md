@@ -23,6 +23,8 @@ Basic reverse proxy. Receives the target URL as a base64-encoded `X-Target` head
 
 `IMPERSONATE` only chooses *which* browser. Profile names are the serde names of `wreq_util::Emulation` — `chrome_100`…`chrome_137`, `firefox_109`…`firefox_139`, `safari_16`/`safari_18`, `edge_*`, `okhttp_5`. An unknown name logs a warning and falls back to the default rather than failing to start.
 
+When the target cannot be reached (DNS, connect, timeout) it answers `503` with `X-Proxy-Error: upstream`, so a router can tell its own failure from a `5xx` of the target.
+
 Set it on any instance reachable from the internet — an open `X-Target` proxy will be found and abused. `intermediate-proxy` can attach the header per route with `add_headers` in `routes.lua`.
 
 ### simple-ipv6-proxy
@@ -100,6 +102,11 @@ timeouts and the selector are all decided per route by an embedded Lua config.
 - **Upstream types** by URL scheme: `http(s)://` endpoint (`X-Target` header),
   `socks5://` SOCKS5, `forward://` HTTP forward proxy. HTTP/1 only.
 
+- **Dead DNS** — before any upstream is tried, the target host is looked up
+  with the system resolver (cached 5 min, NXDOMAIN 1 min). NXDOMAIN or no
+  records answers `502` with `X-Proxy-Error: dns` at once, so a dead name
+  never bans the pool. Resolver errors other than that do not block.
+
 Wire API is unchanged: clients still send the base64 target in `X-Target`.
 
 **Port:** `3000` (env `PORT`)
@@ -117,6 +124,7 @@ Wire API is unchanged: clients still send the base64 target in `X-Target`.
 | `TRANSPORT_PROBE_URL` | URL the fast global prober uses to recover connect-dead proxies (empty disables) | `https://www.google.com/generate_204` |
 | `TRANSPORT_PROBE_INTERVAL_MS` | How often connect-fatal proxies are re-probed | `10000` |
 | `TRANSPORT_PROBE_TIMEOUT_MS` | Per-probe timeout for the transport prober | `8000` |
+| `DNS_CHECK` | Answer `502 X-Proxy-Error: dns` for targets whose host does not resolve | `true` |
 
 `routes.lua` missing or unparseable at startup is fatal (the proxy can't route
 without it). `proxies.txt` missing starts empty and warns — the watcher picks
