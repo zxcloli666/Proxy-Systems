@@ -74,6 +74,18 @@ async fn serve(
         Err(_) => return text_response(StatusCode::BAD_REQUEST, "Invalid target URL"),
     };
 
+    if let Some(dns) = &state.dns {
+        if dns.missing(&host).await {
+            let mut resp = text_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Proxy Error: dns: {host} does not resolve"),
+            );
+            resp.headers_mut()
+                .insert("x-proxy-error", HeaderValue::from_static("dns"));
+            return resp;
+        }
+    }
+
     let body = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return text_response(StatusCode::BAD_REQUEST, "Failed to read request body"),

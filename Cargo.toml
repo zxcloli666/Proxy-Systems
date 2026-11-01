@@ -38,6 +38,7 @@ dashmap = "6"
 parking_lot = "0.12"
 regex = "1"
 smallvec = "1"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 fastrand = "2"
 ahash = "0.8"
 

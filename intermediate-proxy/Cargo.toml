@@ -29,3 +29,4 @@ regex = { workspace = true }
 smallvec = { workspace = true }
 fastrand = { workspace = true }
 ahash = { workspace = true }
+hickory-resolver = { workspace = true }

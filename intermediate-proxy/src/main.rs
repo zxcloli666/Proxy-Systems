@@ -1,4 +1,5 @@
 mod dispatch;
+mod dns;
 mod forward;
 mod handler;
 mod health;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub pool: Arc<ProxyPool>,
     pub lua: Arc<LuaPool>,
     pub max_hard_attempts: usize,
+    pub dns: Option<dns::DnsCheck>,
 }
 
 #[tokio::main]
@@ -97,6 +99,9 @@ async fn main() {
         pool: Arc::clone(&pool),
         lua: Arc::clone(&lua),
         max_hard_attempts,
+        dns: env_bool("DNS_CHECK", true)
+            .then(dns::DnsCheck::from_system)
+            .flatten(),
     });
 
     let app = Router::new()

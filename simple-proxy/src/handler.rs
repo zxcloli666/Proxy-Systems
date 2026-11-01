@@ -82,10 +82,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Proxy error: {}", e);
-            return text_response(
+            let mut resp = text_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!("Proxy Error: {e}"),
             );
+            resp.headers_mut()
+                .insert("x-proxy-error", HeaderValue::from_static("upstream"));
+            return resp;
         }
     };
 
