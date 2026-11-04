@@ -13,7 +13,7 @@
 #                      needs to dlopen libclang — impossible in a static musl
 #                      build.
 
-FROM rust:1-alpine AS builder
+FROM mirror.gcr.io/library/rust:1.99.1-alpine3.24 AS builder
 # gcc: mlua `vendored` compiles Lua 5.4 C sources via the cc crate.
 RUN apk add --no-cache musl-dev cmake make perl gcc
 WORKDIR /build
@@ -55,7 +55,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
           target/release/tor-proxy \
           /out/
 
-FROM rust:1-bookworm AS builder-simple
+FROM mirror.gcr.io/library/rust:1.99.1-bookworm AS builder-simple
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         cmake make perl git golang-go clang libclang-dev pkg-config \
